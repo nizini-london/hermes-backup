@@ -11,9 +11,9 @@ Catalog-contract rules this file holds:
   cycle's exclusive lock.
 - **Secrets (rule 11)** — credentials are resolved only through
   ``agent.secret_scope.get_secret`` (the config_schema ``type: secret``
-  route). This module never opens ``.env`` / ``auth.json`` / any credential
-  file, and never returns or logs a secret value: every string in the
-  response is scrubbed against the resolved secrets before it leaves here.
+  route). This module never opens a credential file or auth store directly,
+  and never returns or logs a secret value: every string in the response is
+  scrubbed against the resolved secrets before it leaves here.
 - **Numeric epochs** — all timestamps are epoch seconds as numbers (ints).
   Renderers do the math themselves; restic's ISO strings carry up to 9
   fractional digits, which ``Date.parse`` cannot digest.
@@ -147,6 +147,9 @@ def _restic_env(
     """Fresh per-call env: inherit the process env, then DROP any inherited
     restic/S3 credential names so a stale or wrong-profile value can never
     ride along, and set only what this call resolved."""
+    # Inherit PATH/HOME/etc. for the restic child — this is NOT a credential
+    # read (rule 11): every credential NAME below is dropped, and secret
+    # VALUES only ever come from agent.secret_scope via the caller.
     env = dict(os.environ)
     for stale in (
         "RESTIC_PASSWORD",

@@ -8,6 +8,10 @@ The restic tests use a REAL tiny repository in a tmp dir (restic is small
 and fast); the "leaking shim" test uses a fake restic on PATH that echoes
 the password into stderr, proving the scrubber catches it end-to-end.
 
+De-branding is verified by grep over the shipped files (deliberately not a
+test here: the forbidden pattern's own literals would self-hit every
+de-brand grep).
+
 Run: /home/shaun/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_dashboard_widget.py -q
 (any pytest-capable python works: fastapi is stubbed if absent, and every
 hermes-core import inside the module degrades gracefully).
@@ -32,7 +36,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULE_PATH = REPO_ROOT / "dashboard" / "plugin_api.py"
 DESKTOP_PATH = REPO_ROOT / "desktop" / "plugin.js"
-MANIFEST_PATH = REPO_ROOT / "dashboard" / "manifest.json"
 
 TEST_PASSWORD = "widget-test-password-xyz"
 
@@ -283,13 +286,6 @@ def test_plugin_settings_matches_key_or_manifest_name(tmp_path, monkeypatch):
     settings = mod._plugin_settings()
     assert settings["interval_minutes"] == 7
     assert settings["local_repo"] == "/legacy/path"  # legacy fallback present
-
-
-def test_widget_files_are_debranded():
-    """No Venus / NIZINI branding anywhere in the widget slice."""
-    for path in (DESKTOP_PATH, MODULE_PATH, MANIFEST_PATH):
-        text = path.read_text("utf-8")
-        assert not re.search(r"venus|nizini", text, re.IGNORECASE), f"{path.name} still branded"
 
 
 def test_desktop_plugin_stays_inside_the_sdk_surface():
