@@ -26,9 +26,14 @@ restic reads pass `--no-lock`. Finish or fail a step before starting the next.
 3. **Structural check, offsite leg** — `restic check`. Routine cycles never
    full-read the offsite repo, so this structural check plus the dump test in
    the next step are the offsite copy's regular evidence of health.
-4. **Real restore test** — pick one small, real, currently-existing file.
-   `restic dump` it from EACH leg into a scratch directory and byte-compare
-   each copy against the live file.
+4. **Real restore test** — pick one small, real file that is UNCHANGED since
+   the snapshot being tested (mtime predating the snapshot, or byte-identical
+   across the two most recent snapshots of that path). `restic dump` it from
+   EACH leg into a fresh scratch directory and byte-compare each copy against
+   the live file. A live mismatch on a file known to be unchanged is a real
+   failure; a mismatch on a file that changed since the snapshot is a bad
+   pick — record it as `file_pick_mismatch` and re-run with a stable file.
+   Never report the backup as broken off one changed file.
 5. **Verdict** — PASS/FAIL per step. Append
    `DRILL <date> <verdict> driver=<who>` to the backup log. A drill that is not
    logged did not happen.
@@ -50,8 +55,11 @@ automated drill, which never full-reads it.
   re-checks clean. The other leg remains independent evidence; report both, and
   never let a healthy leg's PASS cover for a failed one.
 - **Dump/compare FAIL** — the leg can list snapshots but cannot produce a
-  byte-identical file: a restore-capability failure. Re-run against a different
-  snapshot; if it persists, plan a re-seed from the other leg.
+  byte-identical file against one UNCHANGED since the snapshot: a
+  restore-capability failure. First rule out a bad file pick — a changed
+  file is an expected mismatch; re-pick a stable file and re-run. A
+  persistent mismatch on stable files is real; plan a re-seed from the other
+  leg.
 
 ## Diagnosis order
 

@@ -46,20 +46,33 @@ fail fast instead of blocking on a running backup cycle.
 
 ## Recipe: single-file recovery
 
-1. Dump the file into scratch:
+1. Create a fresh scratch directory, then dump into it:
+   `mkdir -p /tmp/restore-<date>`
    `restic dump <snap> /absolute/path/as/stored > /tmp/restore-<date>/<filename>`
-2. Verify: run `sha256sum` on the restored copy and the live copy — they must
-   match byte-for-byte.
-3. Only then copy into place, snapshotting the live file first.
+2. Verify you got the right version. Restic already guarantees the bytes
+   match what the snapshot stored — what you are confirming is WHICH
+   snapshot content came back and whether it is usable:
+   - File exists live and should be unchanged: `sha256sum` both copies;
+     matching hashes confirm a clean restore.
+   - File was deleted: there is no live copy to compare — verify by opening
+     the restored file (right type, plausible content). A missing live
+     counterpart is not a failure.
+   - Live file is damaged and you are repairing it: the hashes are SUPPOSED
+     to differ. That mismatch confirms you pulled an older, correct version;
+     it is not an error.
+3. Only then copy into place, snapshotting the live file first (when one
+   exists).
 
 The highest-value single-file recoveries are the agent's memory, profile, and
-configuration files — verify those byte-for-byte before touching anything else.
+configuration files — apply the verification discipline above to those first,
+before touching anything else.
 
 ## Recipe: subtree recovery (a directory clobbered by a bad tool call)
 
 1. Recreate just that subtree:
    `restic restore <snap> --include /absolute/path/inside/snapshot --target /tmp/restore-<date>/`
-2. Verify the restored files: hash-check them, and syntax-check scripts
+2. Verify the restored files: hash-check them against the live copies where
+   those exist and should be unchanged, and syntax-check scripts
    (`bash -n`, `python -m py_compile`) before they go back into place.
 3. Copy into place. Never restore over the live tree directly.
 
