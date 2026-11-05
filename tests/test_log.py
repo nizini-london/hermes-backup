@@ -66,7 +66,7 @@ def test_drill_line_parse(data_root):
 
 def test_drill_line_latest_wins_and_invalid_ignored(data_root):
     _write_log([
-        "DRILL 2026-10-01 FAIL driver=shaun",
+        "DRILL 2026-10-01 FAIL driver=operator",
         "DRILL not-a-date",
         "DRILL 2026-11-05 PASS driver=operator",
     ])
@@ -76,10 +76,10 @@ def test_drill_line_latest_wins_and_invalid_ignored(data_root):
 
 
 def test_append_drill_line_normalizes(data_root):
-    engine.append_drill_line("weird-verdict", "shaun")
+    engine.append_drill_line("weird-verdict", "operator")
     drill = engine.last_drill_verdict()
     assert drill["verdict"] == "FAIL"  # anything not PASS/FAIL is FAIL
-    assert drill["driver"] == "shaun"
+    assert drill["driver"] == "operator"
 
 
 def test_log_rotation(data_root, monkeypatch):

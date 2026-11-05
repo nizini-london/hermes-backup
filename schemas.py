@@ -173,7 +173,7 @@ BACKUP_DRILL_SCHEMA = _schema(
         "description": "Optional specific file (absolute, inside the source tree) for the dump test. Default: a deterministic small file is picked.",
     }, "driver": {
         "type": "string",
-        "description": "Who is driving this drill (goes into the log line, e.g. 'agent', 'shaun'). Default 'agent'.",
+        "description": "Who is driving this drill (goes into the log line, e.g. 'agent', 'ops'). Default 'agent'.",
     }},
 )
 
