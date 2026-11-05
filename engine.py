@@ -11,7 +11,9 @@ table) to a plugin engine:
 - per-leg independence: a down local leg never gates the offsite leg;
 - restic exit code 3 (source files vanished mid-read) is tolerated;
 - prune + the 2% data sample are throttled to the first cycle after the top of
-  the hour via ``prune="auto"``;
+  the hour via ``prune="auto"``; a failed or skipped pass records "failed"
+  and is retried by the next cycle in the window — only a pass where the
+  prune AND the data check succeeded records "completed" and closes the slot;
 - hot SQLite databases are shadow-copied INSIDE the backup source tree
   (``<source>/.db-shadow/``) before a cycle and cleaned up after it;
 - single-instance cycles via a non-blocking lockfile in the plugin data dir;
@@ -714,8 +716,17 @@ def _maintenance_state_path() -> Path:
 
 
 def _last_maintenance_epoch() -> Optional[float]:
+    """Epoch of the last COMPLETED maintenance pass — None when the last
+    attempt failed or was never made (fix round 2, P2: a failed pass must
+    not consume the hourly window). The record's ``state`` distinguishes
+    ``completed`` (done, repeats in this window skip) from ``failed``
+    (attempted but not successful: the next auto cycle in the window
+    retries). Records written before round 2 carried no ``state`` field and
+    only ever marked completion."""
     try:
         data = json.loads(_maintenance_state_path().read_text())
+        if not isinstance(data, dict) or data.get("state", "completed") != "completed":
+            return None
         value = data.get("last_maintenance_epoch")
         return float(value) if value is not None else None
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
@@ -723,11 +734,13 @@ def _last_maintenance_epoch() -> Optional[float]:
 
 
 def _maintenance_done_this_window(now: Optional[float] = None) -> bool:
-    """True when an hourly maintenance pass already completed inside the
+    """True when an hourly maintenance pass already COMPLETED inside the
     CURRENT top-of-hour window (fix round 1, P2: a timer firing every
     interval_minutes must not re-run forget --prune + the 2% sample 2-3
     times an hour). Recording only ever happens in-window, so matching the
-    wall-clock hour is sufficient."""
+    wall-clock hour is sufficient. A FAILED attempt records state="failed"
+    instead, leaving the window open for the next cycle to retry (fix
+    round 2)."""
     last = _last_maintenance_epoch()
     if last is None:
         return False
@@ -737,13 +750,22 @@ def _maintenance_done_this_window(now: Optional[float] = None) -> bool:
            (ln.tm_year, ln.tm_mon, ln.tm_mday, ln.tm_hour)
 
 
-def _record_hourly_maintenance(now: Optional[float] = None) -> None:
+def _record_maintenance(state: str, now: Optional[float] = None) -> None:
+    """Persist the outcome of this window's maintenance attempt.
+
+    ``completed`` closes the slot: repeats inside the window skip (round-1
+    P2#9). ``failed`` leaves it open: the next auto cycle in the window
+    retries the failed pass instead of reporting success without repeating
+    the failed check (fix round 2). The not-due case — prune="auto" outside
+    the throttle window, or no attempt at all — never writes a record.
+    """
     try:
         path = _maintenance_state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(
-            {"last_maintenance_epoch": now if now is not None else time.time()}))
+        tmp.write_text(json.dumps({
+            "state": state,
+            "last_maintenance_epoch": now if now is not None else time.time()}))
         os.replace(tmp, path)
     except OSError as exc:
         logger.warning("hermes-backup: could not record maintenance state: %s", exc)
@@ -933,9 +955,20 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
                 if local_leg and _repo_state(local_leg) == "ready":
                     sample_result = _summarize_check(restic_check(local_leg, sample_pct=2),
                                                      local_leg.secrets)
-                # the pass completed — record it so repeats skip (force
-                # prunes unconditionally but also closes the window's slot)
-                _record_hourly_maintenance()
+                # Fix round 2 P2: completion is recorded ONLY for work that
+                # actually succeeded — every wanted leg's prune returned ok
+                # AND the 2% data check passed when a local leg is
+                # configured. A failed or skipped check records "failed" so
+                # the next auto cycle in the window RETRIES the pass instead
+                # of reporting success without repeating the failed check.
+                # (force prunes unconditionally but also only closes the
+                # slot on success; the not-due case never writes a record.)
+                local_wanted = local_leg is not None
+                sample_ok = ((not local_wanted)
+                             or bool(sample_result and sample_result.get("ok")))
+                pruned_ok = all(bool(r.get("pruned")) for r in prune_results.values())
+                _record_maintenance(
+                    "completed" if (pruned_ok and sample_ok) else "failed")
             r2_leg = next((leg for leg in wanted if leg.leg_id == "r2"), None)
             if r2_leg and _repo_state(r2_leg) == "ready":
                 structural["r2"] = _summarize_check(restic_check(r2_leg), r2_leg.secrets)
