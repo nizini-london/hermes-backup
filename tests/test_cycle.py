@@ -236,6 +236,32 @@ def test_cycle_no_wanted_legs_fails_with_setup_guidance(data_root, tmp_path,
         assert result["legs"][leg_id]["verdict"] == "skip"
 
 
+def test_hourly_maintenance_once_per_window(data_root, tmp_path, plugin_env,
+                                            source_tree, local_repo,
+                                            restic_shim, shim_state, shim_calls,
+                                            monkeypatch):
+    """Fix round 1 P2: prune='auto' ran forget --prune + the 2% sample on
+    EVERY cycle inside the top-of-hour window (a 5-minute timer re-pruned 2-3
+    times an hour). The maintenance pass now runs ONCE per window: the
+    completed pass is recorded in state; repeats skip loudly. prune='force'
+    still always prunes."""
+    write_state(shim_state, fake_all=True)
+    cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
+    monkeypatch.setattr(engine, "_top_of_hour_window", lambda cfg, now=None: True)
+
+    engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    assert len([c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]) == 1
+    assert engine._last_maintenance_epoch() is not None
+
+    r2 = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    forgets = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]
+    assert len(forgets) == 1, forgets  # repeat within the window: SKIPPED
+    assert "already completed" in r2["detail"].get("prune_note", ""), r2["detail"]
+
+    engine.run_cycle(cfg, prune="force", secrets=fresh_secrets())
+    assert len([c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]) == 2
+
+
 def test_cycle_refuses_when_source_unresolvable(data_root, tmp_path, plugin_env,
                                                 source_tree, local_repo,
                                                 restic_shim, shim_state,

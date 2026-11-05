@@ -693,12 +693,55 @@ def cleanup_shadow_dbs(source: Optional[Path]) -> bool:
 
 
 # ── snapshot cycle ───────────────────────────────────────────────────────────
+MAINTENANCE_STATE_FILENAME = "maintenance-state.json"
+
+
 def _top_of_hour_window(cfg: Config, now: Optional[float] = None) -> bool:
     """True within the first ``interval_minutes`` of the hour — the throttle
     window the reference stack used for prune + the 2% data check."""
     minutes = max(1, int(cfg.interval_minutes or 5))
     now = now if now is not None else time.time()
     return time.localtime(now).tm_min < minutes
+
+
+def _maintenance_state_path() -> Path:
+    return plugin_data_dir() / MAINTENANCE_STATE_FILENAME
+
+
+def _last_maintenance_epoch() -> Optional[float]:
+    try:
+        data = json.loads(_maintenance_state_path().read_text())
+        value = data.get("last_maintenance_epoch")
+        return float(value) if value is not None else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _maintenance_done_this_window(now: Optional[float] = None) -> bool:
+    """True when an hourly maintenance pass already completed inside the
+    CURRENT top-of-hour window (fix round 1, P2: a timer firing every
+    interval_minutes must not re-run forget --prune + the 2% sample 2-3
+    times an hour). Recording only ever happens in-window, so matching the
+    wall-clock hour is sufficient."""
+    last = _last_maintenance_epoch()
+    if last is None:
+        return False
+    now = now if now is not None else time.time()
+    lt, ln = time.localtime(last), time.localtime(now)
+    return (lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour) == \
+           (ln.tm_year, ln.tm_mon, ln.tm_mday, ln.tm_hour)
+
+
+def _record_hourly_maintenance(now: Optional[float] = None) -> None:
+    try:
+        path = _maintenance_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {"last_maintenance_epoch": now if now is not None else time.time()}))
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("hermes-backup: could not record maintenance state: %s", exc)
 
 
 def _leg_backup(leg: Leg, cfg: Config, extra_excludes: Optional[list[str]] = None) -> dict:
@@ -868,7 +911,13 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
         sample_result = None
         structural = {}
         if wanted and not results.get("skipped"):
-            if throttled:
+            if throttled and prune != "force" and _maintenance_done_this_window():
+                # P2#9 (fix round 1): the hourly pass already ran in this
+                # window — repeats are skipped, loudly.
+                detail["prune_note"] = ("hourly maintenance already completed in "
+                                        "this top-of-hour window — prune + 2% "
+                                        "sample skipped")
+            elif throttled:
                 for leg in wanted:
                     try:
                         prune_results[leg.leg_id] = _leg_forget(leg, cfg)
@@ -879,6 +928,9 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
                 if local_leg and _repo_state(local_leg) == "ready":
                     sample_result = _summarize_check(restic_check(local_leg, sample_pct=2),
                                                      local_leg.secrets)
+                # the pass completed — record it so repeats skip (force
+                # prunes unconditionally but also closes the window's slot)
+                _record_hourly_maintenance()
             r2_leg = next((leg for leg in wanted if leg.leg_id == "r2"), None)
             if r2_leg and _repo_state(r2_leg) == "ready":
                 structural["r2"] = _summarize_check(restic_check(r2_leg), r2_leg.secrets)
