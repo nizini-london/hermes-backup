@@ -99,7 +99,9 @@ def test_timer_state_shape(data_root):
 def test_unit_texts_and_cron_liner(data_root, tmp_path):
     units = engine.systemd_unit_text(5)
     assert "OnCalendar=*:0/5" in units["timer"]
-    assert "EnvironmentFile=%h/.config/hermes-backup.env" in units["service"]
+    # QA S2 (fix round 2): optional '-EnvironmentFile=' — a missing env file
+    # must not fail the unit at load; the install reports the absence loudly.
+    assert "EnvironmentFile=-%h/.config/hermes-backup.env" in units["service"]
     assert "cycle.py" in units["service"]
     assert "EnvironmentFile" not in units["timer"]
     assert engine._on_calendar(7).startswith("*-*-* *:0/7")
