@@ -43,7 +43,9 @@ def _guarded(tool: str, fn, args: dict, cfg=None):
         return fn(args, cfg)
     except Exception as exc:  # noqa: BLE001 — the tool contract forbids raising
         logger.exception("hermes-backup: %s failed unexpectedly", tool)
-        return tool_error(tool, f"unexpected failure: {exc}")
+        # QA N1: the last-resort envelope is outgoing text like any other —
+        # a crash message can carry credential material, so it scrubs too.
+        return tool_error(tool, f"unexpected failure: {engine.scrub(str(exc))}")
 
 
 def _cfg_from(args: dict, cfg: engine.Config | None = None) -> engine.Config:
