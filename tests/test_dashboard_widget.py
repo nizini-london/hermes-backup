@@ -41,6 +41,14 @@ DESKTOP_PATH = REPO_ROOT / "desktop" / "plugin.js"
 
 TEST_PASSWORD = "widget-test-password-xyz"
 
+# The restic/S3 credential env names dashboard/plugin_api.py::_restic_env()
+# drops from the child env (cross-reference that list) — the names a status()
+# call must never WRITE into the process env (QA S4).
+_CREDENTIAL_ENV_NAMES = frozenset({
+    "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD_COMMAND",
+    "RESTIC_REPOSITORY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+})
+
 ISO_STRING_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
 
 
@@ -446,7 +454,8 @@ def test_hermes_cron_is_visible_when_no_systemd_unit_exists(tmp_path, monkeypatc
 
 def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch):
     """A fake restic on PATH prints the password into stderr: the response
-    must arrive scrubbed, and the process env must stay clean."""
+    must arrive scrubbed, and status() must not WRITE any credential name
+    into the process env (asserted relative to a pre-call snapshot — QA S4)."""
     mod = _load_plugin_api(tmp_path, monkeypatch)
     shim_dir = tmp_path / "bin"
     shim_dir.mkdir()
@@ -467,6 +476,7 @@ def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch)
         mod, "_secret",
         lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
 
+    before = frozenset(os.environ)  # ambient env, incl. any inherited credential
     payload = mod.status()
     local, r2 = payload["legs"][0], payload["legs"][1]
 
@@ -475,7 +485,18 @@ def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch)
     assert TEST_PASSWORD not in json.dumps(payload)
     # leg independence: local's failure left the offsite leg untouched (skip)
     assert r2["configured"] is False
-    assert "RESTIC_PASSWORD" not in os.environ
+    # Env hygiene, scoped to status()'s own effect (QA S4): the call must
+    # not ADD any credential name to the process env. An absolute
+    # ``"RESTIC_PASSWORD" not in os.environ`` assert flickers on
+    # multi-tenant hosts whose ambient env legitimately carries such a
+    # name (this host runs a production restic stack) — that inherited
+    # presence is not this module's doing. The drop-inherited-values
+    # property is asserted separately by
+    # test_restic_env_drops_inherited_credentials.
+    added = set(os.environ) - before
+    leaky = added & _CREDENTIAL_ENV_NAMES
+    assert not leaky, (
+        f"status() wrote credential env names into the process env: {sorted(leaky)}")
 
 
 def test_restic_env_drops_inherited_credentials(tmp_path, monkeypatch):
