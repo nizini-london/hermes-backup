@@ -72,10 +72,10 @@ BACKUP_NOW_SCHEMA = _schema(
         "type": "string",
         "enum": ["auto", "force", "skip"],
         "description": (
-            "'auto' (default): prune only on the first cycle after the top of "
-            "the hour. 'force': prune immediately. 'skip': never prune."),
+            "'auto' (default, QA N7: optional parameter — omit it): prune only "
+            "on the first cycle after the top of the hour. 'force': prune "
+            "immediately. 'skip': never prune."),
     }, "source_path": SOURCE_PARAM},
-    ["prune"],
 )
 
 BACKUP_LIST_SCHEMA = _schema(

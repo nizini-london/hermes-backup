@@ -4,6 +4,7 @@ must scrub its error text — a crash message can carry credential material."""
 import json
 
 import engine
+import schemas
 import tools
 
 
@@ -29,3 +30,27 @@ def test_guarded_success_path_untouched():
     """The guard stays transparent when the handler succeeds."""
     out = tools._guarded("backup_status", lambda args, cfg: '{"ok": true}', {})
     assert json.loads(out) == {"ok": True}
+
+
+def test_backup_now_prune_is_optional_with_auto_default(monkeypatch, data_root):
+    """QA N7: the schema marked prune REQUIRED while documenting "'auto'
+    (default)" — the contract contradicted the handler (and the dispatcher
+    demanded the argument for a documented-default). Prune is now optional;
+    the handler keeps its auto default."""
+    assert "prune" not in schemas.BACKUP_NOW_SCHEMA["parameters"]["required"], \
+        schemas.BACKUP_NOW_SCHEMA["parameters"]["required"]
+
+    captured = {}
+
+    def stub_run_cycle(cfg, prune, **kwargs):
+        captured["prune"] = prune
+        return {"verdict": "ok", "legs": {}, "detail": {}, "skipped": False,
+                "now_epoch": 0}
+
+    monkeypatch.setattr(engine, "run_cycle", stub_run_cycle)
+    cfg = engine.Config(source_path="/tmp/somewhere")
+    out = json.loads(tools.handle("backup_now", {}, cfg=cfg))
+    assert out["ok"] is True, out
+    assert captured["prune"] == "auto", captured  # handler default unchanged
+    out = json.loads(tools.handle("backup_now", {"prune": "force"}, cfg=cfg))
+    assert captured["prune"] == "force", captured  # explicit still honored
