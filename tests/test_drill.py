@@ -132,6 +132,36 @@ def test_drill_binary_file_dump_is_byte_exact(data_root, tmp_path, plugin_env,
     assert attempt["legs"]["local"]["size_bytes"] == len(payload)
 
 
+def test_drill_partial_leg_supply_never_passes(data_root, tmp_path, plugin_env,
+                                               source_tree, local_repo,
+                                               restic_shim, shim_state, shim_calls):
+    """Fix round 1 P1: a cross-leg match requires EVERY ready leg to supply
+    the candidate. One leg dumping the file while the other cannot even serve
+    it must NOT pass — that masks the broken leg (old code passed on the
+    half-verified file); the drill re-picks instead."""
+    # real local leg: a REAL snapshot containing all candidates
+    cfg_real = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    result = engine.run_cycle(cfg_real, prune="skip",
+                              secrets=engine.Secrets(restic_password=engine.get_secret(
+                                  "HERMES_BACKUP_RESTIC_PASSWORD")))
+    assert result["verdict"] == "ok", result
+    # shimmed r2 leg (no fake_all: the local repo proxies to REAL restic):
+    # it serves ONLY notes.md — config.yaml is absent from it
+    write_state(shim_state, snapshots=snapshot_fixture(),
+                dump_by_name={str(source_tree / "notes.md"): str(source_tree / "notes.md")})
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo), r2=True)
+    parsed = json.loads(tools.handle("backup_drill", {}, cfg=cfg))
+    dump_step = next(s for s in parsed["steps"] if s["step"] == "dump_and_byte_compare")
+    assert dump_step["verdict"] == "PASS", dump_step
+    assert dump_step["file"] == str(source_tree / "notes.md")  # old code: passed on config.yaml
+    first = dump_step["attempts"][0]
+    assert first["file"] == str(source_tree / "config.yaml")
+    assert first["verdict"] == "file_pick_mismatch"
+    assert first["cross_leg_match"] is False, first  # old code: True (single-leg sha)
+    assert set(first["legs_supplied"]) == {"local"}, first
+    assert first["legs"]["r2"].get("absent") is True
+
+
 def test_drill_skips_cleanly_when_nothing_configured(data_root, tmp_path, plugin_env,
                                                      source_tree):
     """Unconfigured repo set → per-leg SKIP verdicts, not crashes, no FAIL."""

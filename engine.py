@@ -1276,11 +1276,17 @@ def run_drill(cfg: Optional[Config] = None, deep: bool = False,
                                            "(excluded, or created after it)"})
                 continue
             shas = {_sha256_bytes(data) for data in dump_bytes.values()}
-            cross_leg_match = len(shas) == 1 and None not in shas
+            # P1#4 (fix round 1): EVERY selected leg must supply the candidate
+            # before a cross-leg match is true — one matching leg must never
+            # mask a leg that could not even serve the file.
+            supplied_by_every_leg = len(dump_bytes) == len(dumpable_legs)
+            cross_leg_match = (supplied_by_every_leg
+                               and len(shas) == 1 and None not in shas)
             live_bytes = _read_bytes(target)
             live_sha = _sha256_bytes(live_bytes) if live_bytes is not None else None
             matches_live = live_sha is not None and live_sha in shas
             attempt = {"file": str(target), "legs": leg_results,
+                       "legs_supplied": sorted(dump_bytes),
                        "cross_leg_match": cross_leg_match,
                        "live_exists": live_bytes is not None,
                        "matches_live": matches_live if live_bytes is not None else None,
