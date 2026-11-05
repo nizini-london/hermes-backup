@@ -2,6 +2,7 @@
 per step, DRILL log line, deep flag, pgrep refusal while a cycle runs."""
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -10,6 +11,20 @@ from pathlib import Path
 import engine
 import tools
 from conftest import read_calls, write_state, snapshot_fixture
+
+
+def align_candidate_mtimes(source_tree):
+    """QA-N2 ordering companion: candidates are mtime-eligible when their
+    mtime predates the snapshot cutoff. These tests' shim snapshots carry a
+    FIXED past epoch (2026-11-05T09:00Z) while the fixture files are touched
+    now — model the scenario they describe (files existed AT snapshot time)
+    by stamping the candidate files before that epoch. Content is untouched."""
+    cutoff = engine._parse_snapshot_time(snapshot_fixture()[0]["time"])
+    assert cutoff is not None, "fixture snapshot time must parse"
+    for rel in ("config.yaml", "notes.md", ".cache/junk.bin"):
+        candidate = source_tree / rel
+        if candidate.is_file():
+            os.utime(candidate, (cutoff - 60, cutoff - 60))
 
 
 def make_cfg(tmp_path, source, local_repo=None, r2=False):
@@ -67,6 +82,7 @@ def test_drill_repicks_after_mismatch_and_passes(data_root, tmp_path, plugin_env
                     str(source_tree / "config.yaml"): str(source_tree / "notes.md"),
                     str(source_tree / "notes.md"): str(source_tree / "notes.md"),
                 })  # junk.bin: not in dump_by_name → absent → re-pick
+    align_candidate_mtimes(source_tree)
     cfg = make_cfg(tmp_path, source_tree, r2=True)
     parsed = json.loads(tools.handle("backup_drill", {}, cfg=cfg))
     dump_step = next(s for s in parsed["steps"] if s["step"] == "dump_and_byte_compare")
@@ -149,6 +165,7 @@ def test_drill_partial_leg_supply_never_passes(data_root, tmp_path, plugin_env,
     # it serves ONLY notes.md — config.yaml is absent from it
     write_state(shim_state, snapshots=snapshot_fixture(),
                 dump_by_name={str(source_tree / "notes.md"): str(source_tree / "notes.md")})
+    align_candidate_mtimes(source_tree)
     cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo), r2=True)
     parsed = json.loads(tools.handle("backup_drill", {}, cfg=cfg))
     dump_step = next(s for s in parsed["steps"] if s["step"] == "dump_and_byte_compare")
@@ -263,3 +280,61 @@ def test_drill_steps_strictly_sequential(data_root, tmp_path, plugin_env, source
     assert snaps and checks and dumps
     assert max(snaps) < min(checks), "all age queries before any check"
     assert max(checks) < min(dumps), "all checks before any dump"
+
+
+# ── QA N2: documented mtime-eligible ordering + vanished-file tolerance ──────
+def test_drill_candidates_mtime_eligible_first(data_root, tmp_path):
+    """QA N2: the docstring promised 'mtime-eligible candidates first' but the
+    implementation returned plain sorted-rglob order — a file modified AFTER
+    the snapshot (a guaranteed dump-vs-live mismatch, a wasted attempt) could
+    occupy an attempt slot before a stable file. With a cutoff, eligible
+    candidates come first; config.yaml stays preferred within the bucket."""
+    import os
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.yaml").write_text("k: v\n")    # stable + preferred
+    (source / "aaa-churn.bin").write_text("x" * 16)  # modified after snapshot
+    (source / "zzz-stable.md").write_text("y" * 16)  # stable
+    cutoff = int(time.time()) - 3600  # snapshot 1h ago
+    os.utime(source / "config.yaml", (cutoff - 10, cutoff - 10))
+    os.utime(source / "zzz-stable.md", (cutoff - 10, cutoff - 10))
+    future = int(time.time()) + 60
+    os.utime(source / "aaa-churn.bin", (future, future))
+    out = engine._drill_candidates(source, cutoff=cutoff)
+    assert out[0] == "config.yaml", out
+    assert out.index("zzz-stable.md") < out.index("aaa-churn.bin"), out
+
+
+def test_drill_candidates_without_cutoff_keep_historical_order(data_root, tmp_path):
+    """No snapshot epochs yet (cutoff None) → the historical order stands:
+    config.yaml preferred, everything else in sorted walk order."""
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.yaml").write_text("k: v\n")
+    (source / "b.txt").write_text("x")
+    (source / "a.txt").write_text("y")
+    out = engine._drill_candidates(source)
+    assert out == ["config.yaml", "a.txt", "b.txt"]
+
+
+def test_drill_candidates_survives_vanished_file(data_root, tmp_path, monkeypatch):
+    """QA N2: a file vanishing between the rglob walk and its stat() raised
+    OSError out of _drill_candidates → the whole drill step crashed into FAIL
+    instead of just skipping that candidate. The walk now treats a vanished
+    entry as 'skip and re-pick', never a backup problem."""
+    import pathlib
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "config.yaml").write_text("k: v\n")
+    (source / "ghost.txt").write_text("x" * 10)
+    real_stat = pathlib.Path.stat
+
+    def flaky_stat(self, **kwargs):
+        if self.name == "ghost.txt":
+            raise FileNotFoundError("vanished mid-walk")
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", flaky_stat)
+    out = engine._drill_candidates(source)
+    assert "ghost.txt" not in out, out
+    assert "config.yaml" in out, out

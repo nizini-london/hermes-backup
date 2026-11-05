@@ -1369,7 +1369,7 @@ def run_drill(cfg: Optional[Config] = None, deep: bool = False,
     # legs AND vs live — with re-pick on live mismatch (file_pick_mismatch)
     def _dump_test() -> dict:
         source = cfg.source
-        candidates = _drill_candidates(source, file)
+        candidates = _drill_candidates(source, file, cutoff=cutoff)
         if source is None:
             return {"verdict": "SKIP", "detail": "no source configured"}
         if not candidates:
@@ -1486,9 +1486,15 @@ def _mtime_eligible(path: Path, cutoff_epoch: Optional[int]) -> Optional[bool]:
         return False
 
 
-def _drill_candidates(source: Optional[Path], override: str = "") -> list[str]:
+def _drill_candidates(source: Optional[Path], override: str = "",
+                      cutoff: Optional[int] = None) -> list[str]:
     """Small real files (1B–256KB, depth ≤ 3) ordered for the dump test —
-    ``config.yaml`` preferred, mtime-eligible candidates first."""
+    ``config.yaml`` preferred, mtime-eligible candidates first (QA N2: the
+    docstring promised this ordering; it is now implemented). A file whose
+    mtime is after the snapshot cutoff cannot byte-match live (it changed
+    since), so eligible candidates get the attempt slots first; ``cutoff``
+    None (no snapshot epochs yet) keeps the historical order. A file
+    vanishing mid-walk is skipped — never a drill failure, just a re-pick."""
     if source is None or not source.is_dir():
         return []
     if override:
@@ -1496,24 +1502,34 @@ def _drill_candidates(source: Optional[Path], override: str = "") -> list[str]:
         if not candidate.is_absolute():
             candidate = source / override
         resolved = candidate.resolve()
-        if not (is_within(resolved, source) and resolved.is_file()
-                and 0 < resolved.stat().st_size <= 256 * 1024):
+        try:
+            if not (is_within(resolved, source) and resolved.is_file()
+                    and 0 < resolved.stat().st_size <= 256 * 1024):
+                return []
+        except OSError:  # vanished between listing and stat — nothing to dump
             return []
         return [str(resolved.relative_to(source))]
     eligible, rest = [], []
     for path in sorted(source.rglob("*")):
-        if not (path.is_file() and path.suffix.lower() not in SQLITE_SUFFIXES
-                and SHADOW_DIRNAME not in path.parts and not path.is_symlink()
-                and 0 < path.stat().st_size <= 256 * 1024):
+        try:
+            if not (path.is_file() and path.suffix.lower() not in SQLITE_SUFFIXES
+                    and SHADOW_DIRNAME not in path.parts and not path.is_symlink()):
+                continue
+            st = path.stat()
+        except OSError:  # vanished mid-walk — skip the candidate, re-pick
+            continue
+        if not (0 < st.st_size <= 256 * 1024):
             continue
         rel = path.relative_to(source)
         if len(rel.parts) > 3:
             continue
-        if path.name == "config.yaml" and path.parent == source:
-            eligible.insert(0, str(rel))
+        entry = (path.name == "config.yaml" and path.parent == source, str(rel))
+        if _mtime_eligible(path, cutoff) is not False:
+            eligible.append(entry)
         else:
-            rest.append(str(rel))
-    return eligible + rest
+            rest.append(entry)
+    eligible.sort(key=lambda e: (not e[0], e[1]))  # config.yaml first, then rel order
+    return [rel for _, rel in eligible + rest]
 
 
 def _sha256_bytes(data: bytes) -> Optional[str]:
