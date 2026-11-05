@@ -285,6 +285,105 @@ def test_hourly_maintenance_once_per_window(data_root, tmp_path, plugin_env,
     assert len([c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]) == 2
 
 
+def test_failed_prune_retries_within_window(data_root, tmp_path, plugin_env,
+                                            source_tree, local_repo,
+                                            restic_shim, shim_state, shim_calls,
+                                            monkeypatch):
+    """Fix round 2 P2 (Greptile PR4): run_cycle recorded hourly maintenance
+    as complete even when the prune failed — a transient failure in the
+    first cycle of the hour consumed the window, and later auto cycles
+    reported success without repeating the failed check. Completion is now
+    recorded ONLY when the work succeeded (prune + data check); failed work
+    stays eligible for retry inside the window."""
+    write_state(shim_state, fake_all=True, forget_rc=1)  # prune fails
+    cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
+    monkeypatch.setattr(engine, "_top_of_hour_window", lambda cfg, now=None: True)
+
+    first = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    assert first["verdict"] == "warn", first  # the failed prune is loud
+    assert engine._last_maintenance_epoch() is None, \
+        "a failed prune must NOT close the window's slot"
+    record = json.loads((Path(engine.plugin_data_dir())
+                         / engine.MAINTENANCE_STATE_FILENAME).read_text())
+    assert record.get("state") == "failed", record
+
+    # the transient prune failure clears before the next cycle in the window
+    write_state(shim_state, forget_rc=0)
+    second = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    forgets = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]
+    assert len(forgets) == 2, forgets  # RETRIED — pre-fix code skipped it
+    assert "already completed" not in second["detail"].get("prune_note", ""), \
+        second["detail"]
+    assert second["verdict"] == "ok", second
+    assert engine._last_maintenance_epoch() is not None
+    record = json.loads((Path(engine.plugin_data_dir())
+                         / engine.MAINTENANCE_STATE_FILENAME).read_text())
+    assert record.get("state") == "completed", record
+
+    # a COMPLETED pass still blocks repeats in the same window (round-1 P2#9)
+    third = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    forgets = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]
+    assert len(forgets) == 2, forgets  # third cycle: skipped, not re-run
+    assert "already completed" in third["detail"].get("prune_note", ""), \
+        third["detail"]
+
+
+def test_failed_sample_check_retries_within_window(data_root, tmp_path,
+                                                   plugin_env, source_tree,
+                                                   local_repo, restic_shim,
+                                                   shim_state, shim_calls,
+                                                   monkeypatch):
+    """Fix round 2 P2: the 2% data check failing also kept the window open —
+    completion requires the prune AND the data check to succeed."""
+    write_state(shim_state, fake_all=True, check_rc=1)  # data check fails
+    cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
+    monkeypatch.setattr(engine, "_top_of_hour_window", lambda cfg, now=None: True)
+
+    first = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    assert first["verdict"] == "warn", first
+    assert engine._last_maintenance_epoch() is None, \
+        "a failed data check must NOT close the window's slot"
+    record = json.loads((Path(engine.plugin_data_dir())
+                         / engine.MAINTENANCE_STATE_FILENAME).read_text())
+    assert record.get("state") == "failed", record
+
+    # the data check heals: the next cycle in the window retries the pass
+    write_state(shim_state, check_rc=0)
+    second = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    forgets = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]
+    assert len(forgets) == 2, forgets  # RETRIED — pre-fix code skipped it
+    assert second["verdict"] == "ok", second
+    record = json.loads((Path(engine.plugin_data_dir())
+                         / engine.MAINTENANCE_STATE_FILENAME).read_text())
+    assert record.get("state") == "completed", record
+
+
+def test_maintenance_without_local_leg_completes_on_prune(data_root, tmp_path,
+                                                          plugin_env,
+                                                          source_tree,
+                                                          restic_shim,
+                                                          shim_state,
+                                                          shim_calls,
+                                                          monkeypatch):
+    """r2-only setup: the 2% sample is a LOCAL-leg check, so the pass
+    completes on prune success alone — otherwise every auto cycle in the
+    window would re-prune r2 all hour (regressing round-1 P2#9). The record
+    still never claims completion unless the prune itself succeeded."""
+    write_state(shim_state, fake_all=True)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)  # no local repo
+    monkeypatch.setattr(engine, "_top_of_hour_window", lambda cfg, now=None: True)
+
+    first = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    assert first["verdict"] == "ok", first
+    assert engine._last_maintenance_epoch() is not None
+
+    repeat = engine.run_cycle(cfg, prune="auto", secrets=fresh_secrets())
+    forgets = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["forget"]]
+    assert len(forgets) == 1, forgets  # completed pass blocks repeats
+    assert "already completed" in repeat["detail"].get("prune_note", ""), \
+        repeat["detail"]
+
+
 def test_cycle_refuses_when_source_unresolvable(data_root, tmp_path, plugin_env,
                                                 source_tree, local_repo,
                                                 restic_shim, shim_state,
