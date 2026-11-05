@@ -691,7 +691,12 @@ def _leg_backup(leg: Leg, cfg: Config, extra_excludes: Optional[list[str]] = Non
             "no-password": "repository password not configured (run backup_setup)",
         }[state]
         return {"leg": leg.leg_id, "verdict": "skip", "reason": reason}
-    argv = ["restic", "backup", str(cfg.source or ".")]
+    source = cfg.source
+    if source is None:  # P1#5 (fix round 1): never fall back to the CWD
+        return {"leg": leg.leg_id, "verdict": "fail",
+                "reason": "no backup source resolved — refusing to snapshot the "
+                          "current directory (set source_path or HERMES_HOME)"}
+    argv = ["restic", "backup", str(source)]
     for pattern in [*(cfg.excludes or []), *(extra_excludes or [])]:
         argv += ["--exclude", pattern]
     argv += ["--json"]
@@ -786,6 +791,19 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
     """
     cfg = cfg or load_config()
     secrets = secrets or Secrets.load()
+
+    # P1#5 (fix round 1): refuse a cycle whose source cannot be resolved.
+    # The old code fell back to the CWD ('restic backup .') — a scheduler job
+    # would "protect" whatever directory it happened to start in and report
+    # success. Loud failure instead: no backup, no success report.
+    if cfg.source is None:
+        reason = ("no backup source could be resolved — refusing to snapshot an "
+                  "unknown directory. Set source_path in the plugin settings "
+                  "(or HERMES_BACKUP_SOURCE under a standalone scheduler). "
+                  "Nothing was backed up and nothing will report success.")
+        log_append(f"FAIL {reason}")
+        return {"verdict": "fail", "skipped": False, "reason": reason,
+                "legs": {}, "detail": {}, "now_epoch": int(time.time())}
 
     lock = None
     try:

@@ -236,6 +236,46 @@ def test_cycle_no_wanted_legs_fails_with_setup_guidance(data_root, tmp_path,
         assert result["legs"][leg_id]["verdict"] == "skip"
 
 
+def test_cycle_refuses_when_source_unresolvable(data_root, tmp_path, plugin_env,
+                                                source_tree, local_repo,
+                                                restic_shim, shim_state,
+                                                shim_calls, monkeypatch):
+    """Fix round 1 P1: a configured repo + unresolvable Hermes home used to
+    back up the CWD ('restic backup .') and report success — protecting
+    whatever directory the scheduler happened to start in. The cycle now
+    REFUSES: loud failure, no restic backup, no success report."""
+    import sys
+    write_state(shim_state, fake_all=True)
+    cfg = engine.Config(source_path="", local_repo=str(local_repo))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
+    assert result["verdict"] == "fail", result
+    assert "source" in result["reason"].lower(), result
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["backup"]], \
+        "no restic backup may run without a resolved source"
+    verdict = engine.last_run_verdict()
+    assert verdict and verdict["verdict"] == "FAIL", verdict  # the loud report
+
+
+def test_leg_backup_refuses_cwd_fallback(data_root, tmp_path, plugin_env,
+                                         source_tree, local_repo,
+                                         restic_shim, shim_state, shim_calls,
+                                         monkeypatch):
+    """Defense in depth for the same P1: _leg_backup itself never falls back
+    to the CWD ('str(cfg.source or ".")') when the source cannot be resolved."""
+    import sys
+    write_state(shim_state, fake_all=True)
+    cfg = engine.Config(source_path="", local_repo=str(local_repo))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    leg = engine.get_leg(cfg, "local", fresh_secrets())
+    out = engine._leg_backup(leg, cfg)
+    assert out["verdict"] == "fail", out
+    assert "source" in out["reason"].lower(), out
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["backup"]]
+
+
 def test_password_never_in_output(data_root, tmp_path, plugin_env, source_tree,
                                   local_repo, restic_shim, shim_state):
     """A failing restic whose fake stderr embeds the password → scrubbed."""
