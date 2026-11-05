@@ -161,7 +161,7 @@ def test_status_cache_serves_within_ttl(tmp_path, monkeypatch):
     calls = {"n": 0}
     real_build = mod._build_payload
 
-    def counting_build():
+    def counting_build(*_a, **_k):
         calls["n"] += 1
         return real_build()
 
@@ -179,6 +179,85 @@ def test_status_cache_serves_within_ttl(tmp_path, monkeypatch):
     mod.status()
     assert calls["n"] == 2
     assert json.loads(cache.read_text("utf-8"))["ts"] > cached["ts"]
+
+
+def test_slow_probe_reports_partial_inside_client_deadline(tmp_path, monkeypatch):
+    """P1 #2 regression: one stalled leg must never push /status past the
+    desktop client's 30 s deadline. The offsite leg's restic stalls; the
+    response still ships — local leg answered, offsite reported ``stalled``
+    (partial status), and the whole request stays far inside 30 s."""
+    import time as _time
+
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    # Shrink the budget so the test itself stays fast: attempt cap 1 s,
+    # overall budget 3 s (production values: 8 s / 22 s).
+    monkeypatch.setattr(mod, "PROBE_ATTEMPT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(mod, "COLD_BUDGET_SECONDS", 3.0)
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "restic"
+    # The offsite (s3:) repo hangs; the local repo answers. (Keyed on the
+    # s3: prefix, not a path substring: the pytest tmp dir contains the test
+    # name, so any "slow"/"fast" match would hit both legs.)
+    shim.write_text(
+        "#!/bin/sh\n"
+        'case "$RESTIC_REPOSITORY" in\n'
+        "  s3:*) sleep 5; echo '[]' ;;\n"
+        "  *) echo '[{\"short_id\":\"abcd1234\",\"time\":\"2026-11-05T08:00:00Z\"}]' ;;\n"
+        "esac\n"
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(
+        mod, "_config_snapshot",
+        lambda: _settings_config({
+            "local_repo": str(tmp_path / "fast-repo"),
+            "r2_endpoint": "slow-endpoint.example",
+            "r2_bucket": "slow-bucket",
+        }))
+    monkeypatch.setattr(
+        mod, "_secret",
+        lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
+
+    started = _time.monotonic()
+    payload = mod.status()
+    elapsed = _time.monotonic() - started
+
+    local, r2 = payload["legs"][0], payload["legs"][1]
+    # The fast leg's answer still ships in full.
+    assert local["reachable"] is True and local["snapshot"]["id"] == "abcd1234"
+    # The stalled leg is honest partial status, not a blank pane and not a
+    # false "unreachable" verdict.
+    assert r2["reachable"] is False
+    assert r2["stalled"] is True
+    assert "timed out" in (r2["error"] or "")
+    # ...and the whole cold request finished inside the client deadline.
+    assert elapsed < 15, f"cold /status took {elapsed:.1f}s (client gives 30 s)"
+    assert TEST_PASSWORD not in json.dumps(payload)
+
+
+def test_empty_repo_is_reachable_not_unreachable(tmp_path, monkeypatch):
+    """P2 #5 regression: a repo that answers with zero snapshots is
+    reachable — "no snapshots yet" — never falsely "repository unreachable"."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "restic"
+    shim.write_text("#!/bin/sh\necho '[]'\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setattr(mod, "_config_snapshot",
+                        lambda: _settings_config({"local_repo": str(tmp_path / "fresh-repo")}))
+    monkeypatch.setattr(
+        mod, "_secret",
+        lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
+
+    payload = mod.status()
+    local = payload["legs"][0]
+    assert local["reachable"] is True          # the repo answered
+    assert local["snapshot"] is None           # nothing backed up yet — a fact, not an error
+    assert not local.get("error")              # and NOT "repository unreachable"
+    assert "unreachable" not in json.dumps(payload)
 
 
 def test_last_run_verdict_survives_progress_flood(tmp_path, monkeypatch):

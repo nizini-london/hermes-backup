@@ -21,6 +21,11 @@ Catalog-contract rules this file holds:
   cache file, so rapid polls never spawn restic subprocesses per tick.
 - **Leg independence** — each leg is probed inside its own guard; one leg's
   failure or misconfiguration never gates or skips the other.
+- **Bounded cold budget** — a cold build must finish inside the desktop
+  client's 30 s deadline: each restic probe is capped and both legs share
+  one overall budget. A leg that cannot answer in time is reported
+  ``stalled`` (partial status), never "missing" — and never mistaken for a
+  definitive failure verdict.
 
 The plugin's cycle log lives at ``$HERMES_HOME/plugin-data/hermes-backup/backup.log``
 (shared convention with the tools layer — keep both sides identical):
@@ -50,6 +55,17 @@ router = APIRouter()
 
 PLUGIN_ID = "hermes-backup"
 CACHE_TTL_SECONDS = 60
+
+# The desktop pane abandons /status after 30 s (REST_TIMEOUT_MS in
+# desktop/plugin.js — keep the pair in sync). A cold build therefore works
+# to an overall budget: every restic probe is individually capped, both
+# legs share one budget, and a leg that misses it is reported ``stalled``
+# instead of holding the response past the client deadline — one stalled
+# offsite leg must never blank the pane (the local leg's answer still
+# ships, the stalled leg ships as "probing/failed").
+COLD_BUDGET_SECONDS = 22.0
+PROBE_ATTEMPT_TIMEOUT_SECONDS = 8.0
+INTER_ATTEMPT_SLEEP_SECONDS = 2.0
 
 # Verdict-to-EOF distance in the cycle log grows without bound (restic
 # progress output floods the log between verdicts), so a small fixed tail
@@ -133,9 +149,12 @@ def _secret(name: str) -> Optional[str]:
 
 # ------------------------------------------------------------- restic reads --
 
-def _run(argv: list, env: dict) -> subprocess.CompletedProcess:
-    """argv-list restic calls only (never shell=True)."""
-    return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=90)
+def _run(argv: list, env: dict, timeout: float = 90) -> subprocess.CompletedProcess:
+    """argv-list restic calls only (never shell=True). The timeout is
+    per-attempt and chosen by the caller: probe attempts are capped by the
+    cold-request budget so a stalled repo cannot hold the widget response
+    past the client deadline."""
+    return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
 
 
 def _restic_env(
@@ -184,33 +203,68 @@ def _iso_to_epoch(value: Any) -> Optional[int]:
         return None
 
 
-def _snapshot_probe(repo: str, env: dict) -> tuple:
+def _snapshot_probe(repo: str, env: dict, deadline: Optional[float] = None) -> tuple:
     """``restic snapshots --latest 1 --no-lock --json`` on one repo.
 
-    Returns ``(snapshot|None, sanitized_error|None)``:
-    ``(snap, None)`` — repo answered and holds snapshots;
-    ``(None, None)`` — repo answered, no snapshot yet (not an error);
-    ``(None, error)`` — unreachable (two attempts, 2 s apart, so a transient
-    hiccup does not flicker the pane red).
+    Returns ``(snapshot|None, sanitized_error|None, stalled)``:
+    ``(snap, None, False)``  — repo answered and holds snapshots;
+    ``(None, None, False)``  — repo answered, no snapshot yet (not an error);
+    ``(None, error, False)`` — unreachable (two attempts, 2 s apart, so a
+                               transient hiccup does not flicker the pane red);
+    ``(None, error, True)``  — the probe could not FINISH inside the
+                               cold-request budget: the leg is reported as
+                               ``stalled`` (still probing / too slow), never
+                               as a definitive failure (P1 #2 — one slow
+                               leg must not blank the pane).
+
+    ``deadline`` is a ``time.monotonic()`` timestamp bounding the whole
+    probe; each attempt is capped by the shorter of
+    PROBE_ATTEMPT_TIMEOUT_SECONDS and the time remaining, and no attempt
+    starts without budget left.
     """
+
+    def remaining() -> Optional[float]:
+        if deadline is None:
+            return None
+        return deadline - time.monotonic()
+
     last_err = None
+    stalled = False
     for attempt in range(2):
+        left = remaining()
+        if left is not None and left <= 0:
+            return (None,
+                    last_err or "probe skipped — the status deadline passed before this leg could be checked",
+                    True)
+        timeout = PROBE_ATTEMPT_TIMEOUT_SECONDS
+        if left is not None:
+            timeout = min(timeout, max(1.0, left))
         try:
-            proc = _run(["restic", "snapshots", "--latest", "1", "--no-lock", "--json"], env)
+            proc = _run(
+                ["restic", "snapshots", "--latest", "1", "--no-lock", "--json"], env, timeout
+            )
             if proc.returncode == 0:
                 snaps = json.loads(proc.stdout or "[]")
                 if isinstance(snaps, list) and snaps:
                     newest = snaps[-1]
                     snap_id = str(newest.get("short_id") or newest.get("id") or "?")
-                    return {"id": snap_id, "epoch": _iso_to_epoch(newest.get("time"))}, None
-                return None, None
+                    return {"id": snap_id, "epoch": _iso_to_epoch(newest.get("time"))}, None, False
+                return None, None, False
             stderr = (proc.stderr or "").strip().splitlines()
             last_err = stderr[0] if stderr else f"restic exited {proc.returncode}"
+            stalled = False
+        except subprocess.TimeoutExpired:
+            last_err = f"probe timed out after {timeout:.0f}s — leg did not answer in time"
+            stalled = True
         except Exception as exc:
             last_err = f"{type(exc).__name__}: {exc}"
+            stalled = False
         if attempt == 0:
-            time.sleep(2)
-    return None, last_err or "repository unreachable"
+            left = remaining()
+            if left is not None and left <= 0:
+                return None, last_err or "repository unreachable", stalled
+            time.sleep(INTER_ATTEMPT_SLEEP_SECONDS)
+    return None, last_err or "repository unreachable", stalled
 
 
 def _scrub(text: str, secret_values: list) -> str:
@@ -232,9 +286,12 @@ def _scrub_payload(node: Any, secret_values: list) -> Any:
     return node
 
 
-def _legs(settings: dict, secrets: dict) -> list:
+def _legs(settings: dict, secrets: dict, deadline: Optional[float] = None) -> list:
     """Per-leg health facts for the configured legs. Independent by
-    construction: every leg returns its own facts, whatever the others did."""
+    construction: every leg returns its own facts, whatever the others did.
+    ``deadline`` (a ``time.monotonic()`` timestamp) bounds the whole probe
+    sequence so one slow leg cannot push the response past the desktop
+    client's 30 s deadline (P1 #2) — it comes back ``stalled`` instead."""
     pw = secrets.get("HERMES_BACKUP_RESTIC_PASSWORD")
     aws_key = secrets.get("HERMES_BACKUP_R2_ACCESS_KEY")
     aws_secret = secrets.get("HERMES_BACKUP_R2_SECRET_KEY")
@@ -271,12 +328,19 @@ def _legs(settings: dict, secrets: dict) -> list:
             aws_key if repo.startswith("s3:") else None,
             aws_secret if repo.startswith("s3:") else None,
         )
-        snap, err = _snapshot_probe(repo, env)
-        if snap:
+        snap, err, stalled = _snapshot_probe(repo, env, deadline)
+        if err is None:
+            # The repo ANSWERED — an empty repo is reachable, not an error
+            # (P2 #5): "no snapshots yet" is a true state, not "down".
             leg["reachable"] = True
-            leg["snapshot"] = snap
+            if snap:
+                leg["snapshot"] = snap
         else:
-            leg["error"] = _scrub(err or "repository unreachable", secret_values)
+            leg["error"] = _scrub(err, secret_values)
+            if stalled:
+                # Probe could not finish inside the budget (P1 #2): ship it
+                # as partial status, not as a definitive failure verdict.
+                leg["stalled"] = True
         out.append(leg)
     return out
 
@@ -401,7 +465,7 @@ def _cache_path() -> Path:
     return _hermes_home() / "plugin-data" / PLUGIN_ID / "widget-status.json"
 
 
-def _build_payload() -> dict:
+def _build_payload(deadline: Optional[float] = None) -> dict:
     settings = _plugin_settings()
     secrets = {name: _secret(name) for name in SECRET_ENV_NAMES}
     try:
@@ -411,7 +475,7 @@ def _build_payload() -> dict:
     payload = {
         "plugin": PLUGIN_ID,
         "interval_minutes": interval if interval > 0 else 5.0,
-        "legs": _legs(settings, secrets),
+        "legs": _legs(settings, secrets, deadline),
         "last_run": _last_run(_log_path()),
         "last_drill": _last_drill(_log_path()),
         "schedule": _schedule(),
@@ -440,7 +504,12 @@ def status():
                 return data
     except Exception:
         pass
-    payload = _build_payload()
+    # Cold build inside a strict overall budget (P1 #2): the desktop client
+    # stops waiting at 30 s, so the whole build — both legs' probes
+    # included — is bounded here. A slow leg answers "stalled" (partial
+    # status); it never holds the response past the client deadline.
+    deadline = time.monotonic() + COLD_BUDGET_SECONDS
+    payload = _build_payload(deadline)
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: chip + pane poll concurrently; a torn write would
