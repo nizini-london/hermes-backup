@@ -1,6 +1,8 @@
 """Log discipline: verdict regex over a LARGE tail, progress lines never
 parse as verdicts, DRILL lines, bounded rotation."""
 
+import time
+
 import engine
 
 
@@ -73,6 +75,40 @@ def test_drill_line_latest_wins_and_invalid_ignored(data_root):
     drill = engine.last_drill_verdict()
     assert drill["date"] == "2026-11-05" and drill["driver"] == "operator"
     assert drill["verdict"] == "PASS"
+
+
+def test_stamp_epoch_is_local_wall_clock(data_root):
+    """Fix round 1 P2: log stamps are written in LOCAL wall-clock
+    (time.strftime), so _stamp_epoch must interpret them in the SAME zone.
+    calendar.timegm read them as UTC: on a UTC+9 host every reported time was
+    9 hours early."""
+    import calendar
+    import datetime
+    import os
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Tokyo"  # fixed UTC+9, no DST — deterministic oracle
+    time.tzset()
+    try:
+        stamp = "2026-11-05 12:00:00"
+        tz9 = datetime.timezone(datetime.timedelta(hours=9))
+        expected = int(datetime.datetime(2026, 11, 5, 12, 0, 0,
+                                         tzinfo=tz9).timestamp())
+        epoch = engine._stamp_epoch(stamp)
+        assert epoch == expected, (epoch, expected)
+        # direction pinned: local 12:00 JST (=03:00 UTC) sits 9h EARLIER in
+        # absolute epoch than the UTC reading of the same wall digits
+        utc_reading = calendar.timegm(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+        assert epoch - utc_reading == -9 * 3600
+        # end-to-end: a verdict line written NOW reads back ~now
+        engine.log_append("OK (local=1 r2=1)")
+        verdict = engine.last_run_verdict()
+        assert abs(verdict["epoch"] - time.time()) < 120, verdict
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
 
 
 def test_append_drill_line_normalizes(data_root):

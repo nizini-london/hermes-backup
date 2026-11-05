@@ -496,12 +496,15 @@ def last_drill_verdict() -> Optional[dict]:
 
 
 def _stamp_epoch(stamp: str) -> Optional[int]:
-    """Log stamps are local wall-clock; convert to numeric epoch (renderer math)."""
+    """Log stamps are local wall-clock; convert to numeric epoch (renderer math).
+
+    ``time.mktime`` interprets the parsed struct as LOCAL time — the same
+    zone the writer used (``time.strftime``). ``calendar.timegm`` treated it
+    as UTC and shifted every timestamp on non-UTC hosts (fix round 1, P2)."""
     try:
-        import calendar
         parsed = time.strptime(stamp, "%Y-%m-%d %H:%M:%S")
-        return calendar.timegm(parsed)
-    except (ValueError, TypeError):
+        return int(time.mktime(parsed))
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
