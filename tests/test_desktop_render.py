@@ -6,11 +6,19 @@ bug shipped 9/9 green: text passed as the THIRD jsx() argument (the
 element KEY, not children) rendered an empty element everywhere.
 
 This harness renders the pane and the statusbar chip for real in Node:
-desktop/plugin.js is loaded as ESM from a scratch node project whose
-stub `react/jsx-runtime` implements the REAL react contract (children
-ride in props; the third argument is the key) and whose stub
-`@hermes/plugin-sdk` serves the injected status. The rendered element
-trees are then walked and the visible text asserted.
+desktop/plugin.js is loaded as ESM (copied as a .mjs AND a scratch
+package.json pins "type": "module" — belt and braces, so the copy loads
+as ESM on EVERY supported Node, with or without automatic module
+detection), with a stub `react/jsx-runtime` implementing the REAL react
+contract (children ride in props; the third argument is the key) and a
+stub `@hermes/plugin-sdk` serving the injected status. The rendered
+element trees are then resolved by a micro-renderer and the visible
+text is asserted.
+
+Zero external dependencies: the stubs are generated inline by this test
+— nothing is symlinked or installed, so it runs offline on any machine
+with a node binary. The ONLY skip is when node itself is missing (same
+as the whole render suite).
 
 Run: /home/shaun/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_desktop_render.py -q
 (needs node on PATH; skips with a clear reason otherwise)
@@ -33,6 +41,8 @@ DESKTOP_PATH = REPO_ROOT / "desktop" / "plugin.js"
 
 
 def _find_node() -> str | None:
+    """Shared discovery logic (the session fixture lives in conftest.py);
+    also unit-pinned by test_find_node_survives_a_nodeless_path."""
     for candidate in ("node", "/usr/bin/node"):
         try:
             proc = subprocess.run([candidate, "--version"], capture_output=True, text=True)
@@ -43,15 +53,23 @@ def _find_node() -> str | None:
     return None
 
 
-node_available = pytest.fixture(scope="module")(lambda: _find_node())
-
-
 def _jsx_runtime_stub() -> str:
     return """\
 // Stub with the REAL react contract: children ride in props; the third
 // argument is the element key. This is what catches P1 #1 — text passed
 // as the third argument becomes a KEY and never appears as rendered text.
+// React's dev key-warning classes are surfaced as testable violations via
+// globalThis.__KEY_VIOLATIONS__ (asserted empty by tests/test_render.py):
+//  - a key INSIDE the props object (React 19 dev: "A props object
+//    containing a key prop is being spread into JSX");
+//  - array children without keys are caught in the micro-renderer walk.
 export function jsx(type, config, maybeKey) {
+  if (config && config.key !== undefined) {
+    ;(globalThis.__KEY_VIOLATIONS__ = globalThis.__KEY_VIOLATIONS__ ?? []).push(
+      'key inside props object (React 19 dev: spread-key warning) — ' +
+      'pass the key as the third jsx() argument'
+    )
+  }
   return {
     $$typeof: Symbol.for('react.element'),
     type,
@@ -90,11 +108,12 @@ export function useQuery() {
 
 
 DRIVER = """\
-import plugin from './plugin.js'
+import plugin from './plugin-under-test.mjs'
 
 // The status under test arrives via env (BACKUP_STATUS_JSON); the SDK
 // stub's useQuery serves it from this global. Set before any render.
 globalThis.__BACKUP_STATUS_JSON__ = process.env.BACKUP_STATUS_JSON ?? 'null'
+globalThis.__KEY_VIOLATIONS__ = []
 
 const registered = []
 const ctx = { register: (cfg) => registered.push(cfg) }
@@ -108,7 +127,21 @@ const SDK_TYPES = new Set(['StatusDot', 'Badge', 'Button', 'Tip'])
 
 function walk(node, out, depth) {
   if (node === null || node === undefined || typeof node === 'boolean') return
-  if (Array.isArray(node)) { node.forEach((n) => walk(n, out, depth)); return }
+  if (Array.isArray(node)) {
+    // React: "Each child in a list should have a unique key prop" — every
+    // ELEMENT in an array needs a key (strings/numbers/nulls do not).
+    for (const child of node) {
+      if (child && typeof child === 'object' && child.$$typeof &&
+          (child.key === null || child.key === undefined)) {
+        globalThis.__KEY_VIOLATIONS__.push(
+          'array child without key: ' +
+          (typeof child.type === 'function' ? child.type.name : String(child.type))
+        )
+      }
+    }
+    node.forEach((n) => walk(n, out, depth))
+    return
+  }
   if (typeof node === 'string' || typeof node === 'number') {
     out.push(String(node))
     return
@@ -144,10 +177,18 @@ if (!paneCfg || !chipCfg) {
   process.stderr.write('driver: pane/chip not registered\\n')
   process.exit(1)
 }
+function chipTones() {
+  return flat(chipCfg)
+    .filter((t) => t.startsWith('@tone:'))
+    .map((t) => t.slice('@tone:'.length))
+}
+
 process.stdout.write(JSON.stringify({
   registered: registered.map((r) => r.id),
   pane: flat(paneCfg),
   chip: flat(chipCfg),
+  chipTones: chipTones(),
+  keyViolations: globalThis.__KEY_VIOLATIONS__ ?? [],
 }))
 """
 
@@ -173,7 +214,10 @@ def _render(tmp_path: Path, node: str, status: dict) -> dict:
         "name": "react", "type": "module",
         "exports": {"./jsx-runtime": "./jsx-runtime.js"}}))
     (react_pkg / "jsx-runtime.js").write_text(_jsx_runtime_stub())
-    shutil.copyfile(DESKTOP_PATH, scratch / "plugin.js")
+    # Copy as .mjs (ESM on every supported Node — even without automatic
+    # module detection) AND ship a package.json pinning "type": "module":
+    # either alone suffices, together nothing can load the copy as CJS.
+    shutil.copyfile(DESKTOP_PATH, scratch / "plugin-under-test.mjs")
     (scratch / "driver.mjs").write_text(DRIVER)
     env = dict(os.environ, BACKUP_STATUS_JSON=json.dumps(status))
     proc = subprocess.run(

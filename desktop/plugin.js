@@ -21,9 +21,11 @@
  * `jsx(type, props, key)` — children ALWAYS ride in `props.children`. The
  * THIRD argument is the element key: text passed there renders an empty
  * element. Every visible string in this file lives in props.children.
- * tests/test_desktop_render.py renders this file in Node and asserts the
- * text is actually present — `node --check` alone cannot catch this class
- * of bug.
+ * Array-element keys ride as the third argument too — putting `key` inside
+ * the props object trips React 19 dev's spread-key warning ("A props object
+ * containing a key prop is being spread into JSX"). Both are pinned by the
+ * render tests: test_desktop_render.py asserts visible text, and
+ * test_render.mjs FAILS the build on any React key warning.
  */
 
 import { Badge, Button, StatusDot, Tip, haptic, host, useQuery } from '@hermes/plugin-sdk'
@@ -147,35 +149,31 @@ function LegRow({ leg, intervalMin, nowMs }) {
     style: rowStyle,
     children: [
       jsxs('div', {
-        key: 'row',
         style: { display: 'flex', alignItems: 'center', gap: 10 },
         children: [
-          jsx(StatusDot, { key: 'dot', tone: tone }),
+          jsx(StatusDot, { tone: tone }, 'dot'),
           jsx('span', {
-            key: 'label',
             style: labelStyle,
             children: leg && leg.leg === 'r2' ? 'Offsite' : 'Local',
-          }),
-          jsx('span', { key: 'value', style: valueStyle, children: primary }),
+          }, 'label'),
+          jsx('span', { style: valueStyle, children: primary }, 'value'),
           jsx('span', {
-            key: 'id',
             style: monoStyle,
             children: (leg && leg.snapshot && leg.snapshot.id) || '—',
-          }),
+          }, 'id'),
           state === 'overdue'
-            ? jsx(Badge, { key: 'badge', variant: 'destructive', children: 'RPO overdue' })
+            ? jsx(Badge, { variant: 'destructive', children: 'RPO overdue' }, 'badge')
             : null,
         ],
-      }),
+      }, 'row'),
       detail
         ? jsx('div', {
-            key: 'detail',
             style: {
               marginTop: 2, marginLeft: 19, fontSize: '0.85em',
               color: 'var(--ui-text-tertiary, inherit)',
             },
             children: detail,
-          })
+          }, 'detail')
         : null,
     ],
   })
@@ -185,9 +183,9 @@ function FactRow({ tone, label, children }) {
   return jsxs('div', {
     style: rowStyle,
     children: [
-      jsx(StatusDot, { tone: tone }),
-      jsx('span', { style: labelStyle, children: label }),
-      jsx('span', { style: { ...monoStyle, marginLeft: 'auto' }, children: children }),
+      jsx(StatusDot, { tone: tone }, 'dot'),
+      jsx('span', { style: labelStyle, children: label }, 'label'),
+      jsx('span', { style: { ...monoStyle, marginLeft: 'auto' }, children: children }, 'value'),
     ],
   })
 }
@@ -272,56 +270,48 @@ function makePane(ctx) {
       },
       children: [
         jsxs('div', {
-          key: 'head',
           style: { display: 'flex', alignItems: 'baseline', gap: 10 },
           children: [
             jsx('span', {
-              key: 'title',
               style: { fontWeight: 700, fontSize: '1.05em' },
               children: 'Hermes Backup',
-            }),
-            jsx(Badge, { key: 'rpo', variant: 'outline', children: `RPO ${intervalMin}m` }),
+            }, 'title'),
+            jsx(Badge, { variant: 'outline', children: `RPO ${intervalMin}m` }, 'rpo'),
             anyOverdue
-              ? jsx(Badge, { key: 'overdue', variant: 'destructive', children: 'RPO overdue' })
+              ? jsx(Badge, { variant: 'destructive', children: 'RPO overdue' }, 'overdue')
               : null,
             jsx('span', {
-              key: 'sched',
               style: {
                 marginLeft: 'auto', fontSize: '0.85em',
                 color: 'var(--ui-text-tertiary, inherit)',
               },
               children: schedLabel,
-            }),
+            }, 'sched'),
           ],
-        }),
+        }, 'head'),
         // Keyed by the leg's own name ('local'/'r2') — stable across polls,
         // not by row position.
         legs.map((leg, i) => jsx(LegRow, {
-          key: (leg && leg.leg) || `leg-${i}`,
           leg: leg, intervalMin: intervalMin, nowMs: nowMs,
-        })),
+        }, (leg && leg.leg) || `leg-${i}`)),
         jsx(FactRow, {
-          key: 'run',
           tone: runTone,
           label: 'Last cycle',
           children: lastRun
             ? `${lastRun.status} · ${ageStr(lastRun.epoch, nowMs) || '?'} ago`
             : 'no record yet',
-        }),
+        }, 'run'),
         jsx(FactRow, {
-          key: 'drill',
           tone: drillTone,
           label: 'Last drill',
           children: drill && drillDate
             ? `${drill.verdict} · ${drillDate}`
             : 'no drill recorded — run backup_drill',
-        }),
+        }, 'drill'),
         jsxs('div', {
-          key: 'actions',
           style: { display: 'flex', gap: 8, marginTop: 'auto', paddingTop: 4 },
           children: [
             jsx(Button, {
-              key: 'backup',
               variant: 'outline',
               size: 'sm',
               onClick: () => sendBackupPrompt(
@@ -329,9 +319,8 @@ function makePane(ctx) {
                 'Backup request sent to the agent'
               ),
               children: 'Backup now',
-            }),
+            }, 'backup'),
             jsx(Button, {
-              key: 'drill',
               variant: 'outline',
               size: 'sm',
               onClick: () => sendBackupPrompt(
@@ -339,9 +328,9 @@ function makePane(ctx) {
                 'Drill request sent to the agent'
               ),
               children: 'Run drill',
-            }),
+            }, 'drill-btn'),
           ],
-        }),
+        }, 'actions'),
       ],
     })
   }
@@ -408,8 +397,8 @@ function makeChip(ctx) {
           color: 'var(--ui-text-secondary, inherit)', font: 'inherit',
         },
         children: [
-          jsx(StatusDot, { key: 'dot', tone: tone }),
-          jsx('span', { key: 'label', children: label }),
+          jsx(StatusDot, { tone: tone }, 'dot'),
+          jsx('span', { children: label }, 'label'),
         ],
       }),
     })
