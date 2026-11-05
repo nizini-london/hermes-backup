@@ -377,6 +377,73 @@ def test_last_drill_parsing(tmp_path, monkeypatch):
     assert isinstance(drill["epoch"], int) and drill["epoch"] > 1_000_000_000
 
 
+def test_schedule_prefers_active_timer_then_cron(tmp_path, monkeypatch):
+    """P2 #6 regression: preference order is active timer > active cron >
+    installed-but-inactive timer > none. An INACTIVE timer used to be
+    returned before cron was ever consulted, hiding an active Hermes cron."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    inactive = {"kind": "systemd", "active": False, "next_run_epoch": None}
+    active_timer = {"kind": "systemd", "active": True, "next_run_epoch": 1700000000}
+    cron = {"kind": "cron", "active": True, "next_run_epoch": 1700000001}
+
+    monkeypatch.setattr(mod, "_systemd_timer", lambda: inactive)
+    monkeypatch.setattr(mod, "_cron_job", lambda: cron)
+    assert mod._schedule() == cron  # a disabled timer must not hide the cron
+
+    monkeypatch.setattr(mod, "_systemd_timer", lambda: active_timer)
+    assert mod._schedule() == active_timer  # an active timer still wins
+
+    monkeypatch.setattr(mod, "_systemd_timer", lambda: inactive)
+    monkeypatch.setattr(mod, "_cron_job", lambda: None)
+    assert mod._schedule() == inactive  # installed-but-off is reported honestly
+
+    monkeypatch.setattr(mod, "_systemd_timer", lambda: None)
+    assert mod._schedule() == {"kind": "none", "active": False, "next_run_epoch": None}
+
+
+def test_active_timer_without_next_elapse_reports_none(tmp_path, monkeypatch):
+    """P2 #8 regression: an active timer whose next elapse is unreadable
+    reports next_run_epoch=None — never an invented next-5-minute-boundary
+    run (that guess was wrong for every interval except 5 minutes)."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "systemctl"
+    # Active, but no parseable NextElapseUSecRealtime property.
+    shim.write_text("#!/bin/sh\necho 'ActiveState=active'\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+
+    schedule = mod._schedule()
+    assert schedule == {"kind": "systemd", "active": True, "next_run_epoch": None}
+    assert schedule["next_run_epoch"] is None  # not a fabricated epoch
+
+
+def test_hermes_cron_is_visible_when_no_systemd_unit_exists(tmp_path, monkeypatch):
+    """The cron path stays reachable end-to-end: no systemd unit (shim exits
+    1) + an enabled Hermes cron job referencing the plugin's tools → the
+    schedule is the cron job with its numeric epoch next run."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "systemctl"
+    shim.write_text("#!/bin/sh\nexit 1\n")  # unit does not exist
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir) + os.pathsep + os.environ.get("PATH", ""))
+    cron_dir = tmp_path / "cron"
+    cron_dir.mkdir(parents=True)
+    (cron_dir / "jobs.json").write_text(
+        json.dumps([{"id": "nightly", "enabled": True,
+                     "next_run_at": "2026-11-06T02:00:00+00:00",
+                     "command": "hermes cron: run backup_now"}]),
+        "utf-8",
+    )
+
+    schedule = mod._schedule()
+    assert schedule["kind"] == "cron" and schedule["active"] is True
+    assert isinstance(schedule["next_run_epoch"], int) and schedule["next_run_epoch"] > 1e9
+
+
 def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch):
     """A fake restic on PATH prints the password into stderr: the response
     must arrive scrubbed, and the process env must stay clean."""

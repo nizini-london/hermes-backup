@@ -416,10 +416,13 @@ def _systemd_timer() -> Optional[dict]:
         active = "ActiveState=active" in out
         match = re.search(r"NextElapseUSecRealtime=(\d+)", out)
         if active and not match:
-            # OnCalendar timers sometimes report the next elapse only in
-            # list-timers; fall back to the next 5-minute boundary.
-            return {"kind": "systemd", "active": True,
-                    "next_run_epoch": int((int(time.time()) // 300 + 1) * 300)}
+            # Active, but the next elapse is unreadable here (OnCalendar
+            # timers sometimes only report it in list-timers). Never invent
+            # a run time (P2 #8): the old next-5-minute-boundary guess was
+            # wrong for every other interval and lied to the renderer. An
+            # honest "active, next run unknown" ships instead — the pane
+            # renders "timer active" with no countdown.
+            return {"kind": "systemd", "active": True, "next_run_epoch": None}
         return {"kind": "systemd", "active": active,
                 "next_run_epoch": int(int(match.group(1)) / 1e6) if (match and active) else None}
     except Exception:
@@ -455,12 +458,18 @@ def _cron_job() -> Optional[dict]:
 
 
 def _schedule() -> dict:
+    """Schedule facts with an honest preference order (P2 #6): an ACTIVE
+    systemd timer wins; otherwise an active Hermes cron job (an installed-
+    but-inactive timer must not hide it); otherwise the inactive timer is
+    reported as the installed-but-off state it is; otherwise none."""
     systemd = _systemd_timer()
-    if systemd:
+    if systemd and systemd.get("active"):
         return systemd
     cron = _cron_job()
     if cron:
         return cron
+    if systemd:
+        return systemd
     return {"kind": "none", "active": False, "next_run_epoch": None}
 
 
