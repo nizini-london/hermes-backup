@@ -119,7 +119,13 @@ function walk(node, out, depth) {
       return
     }
     if (node.type !== null && node.type !== undefined) {
-      out.push('@' + (typeof node.type === 'function' ? node.type.name : String(node.type)))
+      const name = typeof node.type === 'function' ? node.type.name : String(node.type)
+      // StatusDot tones are chip/pane state, not text — carried as a token
+      // so tests can assert the health color semantics.
+      if (name === 'StatusDot' && node.props && node.props.tone) {
+        out.push('@tone:' + node.props.tone)
+      }
+      out.push('@' + name)
     }
     if (node.props && typeof node.props === 'object') walk(node.props.children, out, depth + 1)
   }
@@ -151,6 +157,11 @@ def _render(tmp_path: Path, node: str, status: dict) -> dict:
     render output {registered, pane, chip}."""
     scratch = tmp_path / "node-render"
     shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+    # Pinned module type: on Node without automatic module detection
+    # (18 / 20.18), a bare .js copy of plugin.js loads as CommonJS and its
+    # import statements fail before any assertion runs.
+    (scratch / "package.json").write_text(json.dumps({"type": "module"}))
     sdk_pkg = scratch / "node_modules" / "@hermes" / "plugin-sdk"
     react_pkg = scratch / "node_modules" / "react"
     sdk_pkg.mkdir(parents=True)
@@ -286,6 +297,48 @@ def test_p2_empty_repo_renders_no_snapshots_yet(tmp_path, node_available):
     assert "no snapshots yet" in pane
     assert "run backup_now for the first snapshot" in pane
     assert "unreachable" not in pane
+
+
+def _chip_status(legs: list) -> dict:
+    now = int(time.time())
+    return {
+        "plugin": "hermes-backup", "interval_minutes": 5, "legs": legs,
+        "last_run": None, "last_drill": None,
+        "schedule": {"kind": "none", "active": False, "next_run_epoch": None},
+        "now": now,
+    }
+
+
+def test_p2_chip_tone_stalled_is_warn_not_bad(tmp_path, node_available):
+    """Greptile round-2 P2 regression: the chip must agree with the pane's
+    'probing…' semantics — a stalled (unfinished) check warns; only a real
+    failure (unreachable, not stalled) or RPO-overdue freshness paints it
+    bad. Asserted on the StatusDot tone the chip renders."""
+    if node_available is None:
+        pytest.skip("node not available for the render harness")
+    fresh = {"leg": "local", "configured": True, "reachable": True,
+             "snapshot": {"id": "abcd1234", "epoch": int(time.time()) - 120}}
+    stalled = {"leg": "r2", "configured": True, "reachable": False, "stalled": True,
+               "error": "probe timed out after 8s — leg did not answer in time"}
+    unreachable = {"leg": "r2", "configured": True, "reachable": False,
+                   "error": "connection refused"}
+    overdue = dict(fresh, snapshot={"id": "abcd1234",
+                                    "epoch": int(time.time()) - 4000})
+
+    scenarios = [
+        # (name, legs, expected tone, forbidden tone)
+        ("fresh local + stalled offsite → warn", [fresh, stalled], "warn", "bad"),
+        ("real unreachable leg → bad", [fresh, unreachable], "bad", None),
+        ("all healthy and fresh → good", [fresh], "good", None),
+        ("overdue freshness + stalled → bad (real RPO breach wins)",
+         [overdue, stalled], "bad", None),
+    ]
+    for name, legs, expected, forbidden in scenarios:
+        out = _render(tmp_path, node_available, _chip_status(legs))
+        chip_tones = [t for t in out["chip"] if t.startswith("@tone:")]
+        assert chip_tones == [f"@tone:{expected}"], f"{name}: {chip_tones}"
+        if forbidden:
+            assert f"@tone:{forbidden}" not in chip_tones, name
 
 
 def test_p2_past_next_run_renders_due_now_not_zero(tmp_path, node_available):

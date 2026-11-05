@@ -367,11 +367,18 @@ function makeChip(ctx) {
     const epochs = legs
       .map((leg) => leg && leg.snapshot && leg.snapshot.epoch)
       .filter((e) => typeof e === 'number' && e > 1e9)
-    const failing = legs.some((leg) => leg && leg.configured !== false && !leg.reachable)
+    // A stalled leg is an UNFINISHED check, not a failure (P2): it warns,
+    // it never paints the chip red — matching the pane's "probing…" row.
+    const failing = legs.some(
+      (leg) => leg && leg.configured !== false && !leg.reachable && !leg.stalled
+    )
+    const anyStalled = legs.some((leg) => leg && !!leg.stalled)
     let tone = 'muted'
     let label = 'backup —'
     if (failing) {
       tone = 'bad'
+    } else if (anyStalled) {
+      tone = 'warn'
     }
     if (epochs.length) {
       const age = ageStr(Math.max(...epochs), nowMs)
@@ -379,7 +386,12 @@ function makeChip(ctx) {
         label = `backup ${age}`
         if (!failing) {
           const ageS = Math.max(0, nowMs / 1000 - Math.max(...epochs))
-          tone = ageS < intervalMin * 60 ? 'good' : ageS < intervalMin * 120 ? 'warn' : 'bad'
+          const ageTone = ageS < intervalMin * 60 ? 'good' : ageS < intervalMin * 120 ? 'warn' : 'bad'
+          // A real failure-grade signal (RPO-overdue freshness) still wins;
+          // the stalled leg can only lift 'good' to 'warn'.
+          if (!anyStalled || ageTone === 'bad') {
+            tone = ageTone
+          }
         }
       }
     }

@@ -64,6 +64,11 @@ def test_pane_and_chip_server_render_with_real_react(tmp_path):
             pytest.skip(f"{pkg} not present under {HOST_NODE_MODULES} (offline-safe)")
 
     scratch = tmp_path / "server-render"
+    scratch.mkdir(parents=True)
+    # Pinned module type: on Node without automatic module detection
+    # (18 / 20.18), a bare .js copy of plugin.js loads as CommonJS and its
+    # import statements fail before any assertion runs.
+    (scratch / "package.json").write_text(json.dumps({"type": "module"}))
     sdk_pkg = scratch / "node_modules" / "@hermes" / "plugin-sdk"
     sdk_pkg.mkdir(parents=True)
     (sdk_pkg / "package.json").write_text(
