@@ -283,6 +283,7 @@ class ResticResult:
     stdout: str = ""
     stderr: str = ""
     timed_out: bool = False
+    stdout_bytes: Optional[bytes] = None  # raw capture (binary mode only)
 
     @property
     def ok(self) -> bool:
@@ -311,18 +312,29 @@ class Leg:
         env.pop("RESTIC_PASSWORD_COMMAND", None)
         return env
 
-    def run(self, argv: list[str], timeout: int, allow_no_lock: bool = False) -> ResticResult:
+    def run(self, argv: list[str], timeout: int, allow_no_lock: bool = False,
+            binary: bool = False) -> ResticResult:
         """Run one restic argv list. ``allow_no_lock`` marks read-only calls,
         which always get ``--no-lock``: a programmatic reader must fail fast,
-        never queue behind a cycle's exclusive lock."""
+        never queue behind a cycle's exclusive lock. ``binary`` captures RAW
+        bytes (``restic dump`` output is file content — text mode would raise
+        UnicodeDecodeError on binary files and normalize CRLF; fix round 1)."""
         if shutil.which(RESTIC_BINARY) is None:
             return ResticResult(rc=-1, stderr=_restic_missing_hint())
         if allow_no_lock and "--no-lock" not in argv:
             argv = [*argv, "--no-lock"]
         try:
             proc = subprocess.run(
-                argv, env=self.env(), capture_output=True, text=True, timeout=timeout)
-            return ResticResult(rc=proc.returncode, stdout=proc.stdout or "", stderr=proc.stderr or "")
+                argv, env=self.env(), capture_output=True, text=not binary,
+                timeout=timeout)
+            if binary:
+                raw_out, raw_err = proc.stdout or b"", proc.stderr or b""
+                return ResticResult(rc=proc.returncode,
+                                    stdout=raw_out.decode("utf-8", "surrogateescape"),
+                                    stderr=raw_err.decode("utf-8", "surrogateescape"),
+                                    stdout_bytes=raw_out)
+            return ResticResult(rc=proc.returncode, stdout=proc.stdout or "",
+                                stderr=proc.stderr or "")
         except subprocess.TimeoutExpired:
             return ResticResult(rc=-1, stderr=f"restic {argv[1] if len(argv) > 1 else ''!r} timed out after {timeout}s",
                                 timed_out=True)
@@ -577,9 +589,13 @@ def restic_check(leg: Leg, sample_pct: Optional[float] = None, deep: bool = Fals
 
 
 def restic_dump(leg: Leg, snapshot_id: str, path: str) -> ResticResult:
-    """``restic dump`` a single stored (absolute) path to stdout."""
+    """``restic dump`` a single stored (absolute) path to stdout.
+
+    Captured as RAW bytes (``stdout_bytes``): the output is file content, and
+    text-mode capture both crashes on binary files (UnicodeDecodeError) and
+    normalizes CRLF before the byte-compare (fix round 1, Greptile P1)."""
     return leg.run(["restic", "dump", snapshot_id, path], timeout=TIMEOUTS["dump"],
-                   allow_no_lock=True)
+                   allow_no_lock=True, binary=True)
 
 
 # ── hot SQLite shadow copies ─────────────────────────────────────────────────
@@ -1243,7 +1259,8 @@ def run_drill(cfg: Optional[Config] = None, deep: bool = False,
                     leg_results[leg.leg_id] = {"ok": False, "detail": detail}
                     hard_failure[leg.leg_id] = detail
                     continue
-                data = dump.stdout.encode("utf-8", "surrogateescape")
+                data = (dump.stdout_bytes if dump.stdout_bytes is not None
+                        else dump.stdout.encode("utf-8", "surrogateescape"))
                 dump_bytes[leg.leg_id] = data
                 leg_results[leg.leg_id] = {"ok": True, "file": str(target),
                                            "size_bytes": len(data),

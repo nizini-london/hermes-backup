@@ -106,6 +106,32 @@ def test_drill_fails_when_leg_cannot_serve_the_file(data_root, tmp_path, plugin_
     assert engine.last_drill_verdict()["verdict"] == "FAIL"
 
 
+def test_drill_binary_file_dump_is_byte_exact(data_root, tmp_path, plugin_env,
+                                              source_tree, local_repo):
+    """Fix round 1 P1: dump output is captured as BYTES and hashed raw. A
+    binary candidate (NUL bytes, invalid-UTF-8 sequences, CRLF) must not
+    crash the drill with UnicodeDecodeError (text-mode capture) nor normalize
+    CRLF into a false live-mismatch."""
+    payload = bytes(range(256)) * 64 + b"\r\nCR/LF probe\r\n\x00tail\x00"
+    (source_tree / "blob.bin").write_bytes(payload)
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    result = engine.run_cycle(cfg, prune="skip",
+                              secrets=engine.Secrets(restic_password=engine.get_secret(
+                                  "HERMES_BACKUP_RESTIC_PASSWORD")))
+    assert result["verdict"] == "ok", result
+    parsed = json.loads(tools.handle("backup_drill",
+                                     {"file": str(source_tree / "blob.bin")}, cfg=cfg))
+    assert parsed["verdict"] == "PASS", parsed  # old code: step FAILED on decode error
+    dump_step = next(s for s in parsed["steps"] if s["step"] == "dump_and_byte_compare")
+    assert dump_step["verdict"] == "PASS", dump_step
+    attempt = dump_step["attempt"]
+    assert attempt["cross_leg_match"] is True
+    assert attempt["matches_live"] is True, attempt
+    import hashlib
+    assert attempt["live_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert attempt["legs"]["local"]["size_bytes"] == len(payload)
+
+
 def test_drill_skips_cleanly_when_nothing_configured(data_root, tmp_path, plugin_env,
                                                      source_tree):
     """Unconfigured repo set → per-leg SKIP verdicts, not crashes, no FAIL."""
