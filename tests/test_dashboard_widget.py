@@ -12,9 +12,9 @@ De-branding is verified by grep over the shipped files (deliberately not a
 test here: the forbidden pattern's own literals would self-hit every
 de-brand grep).
 
-Run: /home/shaun/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_dashboard_widget.py -q
-(any pytest-capable python works: fastapi is stubbed if absent, and every
-hermes-core import inside the module degrades gracefully).
+Run: python -m pytest tests/test_dashboard_widget.py -q (any pytest-capable
+python: fastapi is stubbed if absent, and every hermes-core import inside
+the module degrades gracefully).
 
 All hermes/secret-scope access is monkeypatched per test — the suite never
 touches the real profile's config, secrets, or plugin-data directory.
@@ -574,7 +574,7 @@ def test_desktop_plugin_stays_inside_the_sdk_surface():
         assert match is not None and match.group(1) in allowed, stripped
 
 
-def test_desktop_plugin_is_loadable_esm():
+def test_desktop_plugin_is_loadable_esm(tmp_path):
     """node --check parses the file as CommonJS-wrapped ESM syntax (the app
     loads it uncompiled — a syntax error would fail the load at runtime)."""
     node = None
@@ -588,12 +588,12 @@ def test_desktop_plugin_is_loadable_esm():
             continue
     if node is None:
         pytest.skip("node not available for an ESM syntax check")
+    assert node is not None  # skip() above returns — narrow for the checker
     # Rename so node treats the ESM file as a module (no package.json type).
-    with_node = DESKTOP_PATH.parent / "_plugin_esm_check.mjs"
+    # The copy lives in tmp_path, NOT the source tree: a hard kill mid-test
+    # would otherwise litter desktop/ (QA N-6).
+    with_node = tmp_path / "_plugin_esm_check.mjs"
     with_node.write_text(DESKTOP_PATH.read_text("utf-8"), "utf-8")
-    try:
-        proc = subprocess.run([node, "--check", str(with_node)],
-                              capture_output=True, text=True)
-        assert proc.returncode == 0, proc.stderr
-    finally:
-        with_node.unlink(missing_ok=True)
+    proc = subprocess.run([node, "--check", str(with_node)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr

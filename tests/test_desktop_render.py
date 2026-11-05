@@ -20,7 +20,7 @@ Zero external dependencies: the stubs are generated inline by this test
 with a node binary. The ONLY skip is when node itself is missing (same
 as the whole render suite).
 
-Run: /home/shaun/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_desktop_render.py -q
+Run: python -m pytest tests/test_desktop_render.py -q
 (needs node on PATH; skips with a clear reason otherwise)
 """
 
