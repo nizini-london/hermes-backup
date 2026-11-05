@@ -33,18 +33,21 @@ def tool_error(tool: str, message: str, **extra: Any) -> str:
                       ensure_ascii=False)
 
 
-def _guarded(tool: str, fn, args: dict):
+def _guarded(tool: str, fn, args: dict, cfg=None):
     """Never-raise wrapper: any unexpected crash becomes a JSON error."""
     try:
-        return fn(args)
+        return fn(args, cfg)
     except Exception as exc:  # noqa: BLE001 — the tool contract forbids raising
         logger.exception("hermes-backup: %s failed unexpectedly", tool)
         return tool_error(tool, f"unexpected failure: {exc}")
 
 
-def _cfg_from(args: dict) -> engine.Config:
-    """Config for this call; optional source_path override from the tool args."""
-    cfg = engine.load_config()
+def _cfg_from(args: dict, cfg: engine.Config | None = None) -> engine.Config:
+    """Config for this call. ``cfg`` (explicit injection, used by tests and
+    embedders) wins; otherwise the plugin settings are loaded fresh, with an
+    optional ``source_path`` override from the tool args."""
+    if cfg is None:
+        cfg = engine.load_config()
     override = str(args.get("source_path") or "").strip()
     if override:
         cfg.source_path = override
@@ -57,23 +60,23 @@ def _leg_arg(args: dict) -> str:
 
 
 # ── backup_status ────────────────────────────────────────────────────────────
-def _do_status(args: dict) -> str:
-    data = engine.build_status(force=bool(args.get("force")), cfg=_cfg_from(args))
+def _do_status(args, cfg=None) -> str:
+    data = engine.build_status(force=bool(args.get("force")), cfg=_cfg_from(args, cfg))
     return _result("backup_status", **data)
 
 
 # ── backup_now ───────────────────────────────────────────────────────────────
-def _do_now(args: dict) -> str:
+def _do_now(args, cfg=None) -> str:
     prune = str(args.get("prune") or "auto").lower()
     if prune not in ("auto", "force", "skip"):
         return tool_error("backup_now", "prune must be one of auto|force|skip")
-    result = engine.run_cycle(_cfg_from(args), prune=prune)
+    result = engine.run_cycle(_cfg_from(args, cfg), prune=prune)
     return _result("backup_now", **result)
 
 
 # ── backup_list ──────────────────────────────────────────────────────────────
-def _do_list(args: dict) -> str:
-    cfg = _cfg_from(args)
+def _do_list(args, cfg=None) -> str:
+    cfg = _cfg_from(args, cfg)
     leg_id = _leg_arg(args)
     leg = engine.get_leg(cfg, leg_id)
     if not leg.configured:
@@ -86,8 +89,8 @@ def _do_list(args: dict) -> str:
 
 
 # ── backup_verify ────────────────────────────────────────────────────────────
-def _do_verify(args: dict) -> str:
-    cfg = _cfg_from(args)
+def _do_verify(args, cfg=None) -> str:
+    cfg = _cfg_from(args, cfg)
     leg_id = _leg_arg(args)
     leg = engine.get_leg(cfg, leg_id)
     if not leg.configured:
@@ -110,11 +113,11 @@ def _do_verify(args: dict) -> str:
 
 
 # ── backup_restore ───────────────────────────────────────────────────────────
-def _do_restore(args: dict) -> str:
+def _do_restore(args, cfg=None) -> str:
     path = str(args.get("path") or "").strip()
     if not path:
         return tool_error("backup_restore", "path is required (absolute, inside the source tree)")
-    cfg = _cfg_from(args)
+    cfg = _cfg_from(args, cfg)
     # path validation first: refuse outside-source paths before touching restic
     try:
         engine.validate_restore_path(path, cfg)
@@ -128,11 +131,11 @@ def _do_restore(args: dict) -> str:
         return tool_error("backup_restore", result.get("error", "restore failed"),
                           **{k: v for k, v in result.items() if k != "error"})
     result.pop("ok", None)
-    return _result("backup_restore", leg=leg_id, **result)
+    return _result("backup_restore", leg=leg_id, **{k: v for k, v in result.items() if k != "leg"})
 
 
 # ── backup_restore_commit ────────────────────────────────────────────────────
-def _do_commit(args: dict) -> str:
+def _do_commit(args, cfg=None) -> str:
     target_dir = str(args.get("target_dir") or "").strip()
     confirm = bool(args.get("confirm"))
     if not target_dir:
@@ -142,7 +145,7 @@ def _do_commit(args: dict) -> str:
         return tool_error("backup_restore_commit",
                           "refusing to overwrite live files without confirm=true — "
                           "review the restore output with the user first")
-    result = engine.restore_commit(_cfg_from(args), target_dir=target_dir, confirm=True)
+    result = engine.restore_commit(_cfg_from(args, cfg), target_dir=target_dir, confirm=True)
     if not result.pop("ok", False):
         return tool_error("backup_restore_commit", result.get("error", "commit failed"),
                           **{k: v for k, v in result.items() if k != "error"})
@@ -150,8 +153,8 @@ def _do_commit(args: dict) -> str:
 
 
 # ── backup_drill ─────────────────────────────────────────────────────────────
-def _do_drill(args: dict) -> str:
-    cfg = _cfg_from(args)
+def _do_drill(args, cfg=None) -> str:
+    cfg = _cfg_from(args, cfg)
     driver = str(args.get("driver") or "agent")
     result = engine.run_drill(cfg, deep=bool(args.get("deep")),
                               file=str(args.get("file") or ""), driver=driver)
@@ -159,8 +162,8 @@ def _do_drill(args: dict) -> str:
 
 
 # ── backup_setup ─────────────────────────────────────────────────────────────
-def _do_setup(args: dict) -> str:
-    cfg = _cfg_from(args)
+def _do_setup(args, cfg=None) -> str:
+    cfg = _cfg_from(args, cfg)
     missing = engine.restic_missing()
     if missing:
         return tool_error("backup_setup", missing)
@@ -208,9 +211,13 @@ HANDLERS = {
 }
 
 
-def handle(tool: str, args: dict, **kwargs) -> str:
-    """Dispatch entry used by register(); also the seam tests can call directly."""
+def handle(tool: str, args: dict, cfg=None, **kwargs) -> str:
+    """Dispatch entry used by register(); also the seam tests can call directly.
+
+    ``cfg`` is an explicit config injection (tests/embedders); production
+    calls omit it and the handler loads the plugin settings itself.
+    """
     fn = HANDLERS.get(tool)
     if fn is None:
         return tool_error(tool, f"unknown tool {tool!r}")
-    return _guarded(tool, fn, dict(args or {}))
+    return _guarded(tool, fn, dict(args or {}), cfg)

@@ -85,7 +85,17 @@ TIMEOUTS = {
 
 SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 SHADOW_DIRNAME = ".db-shadow"
-SHADOW_SCAN_DEPTH = 2  # source root + one nested level (state.db, profiles/*/state.db)
+# Depth counted in edges from the source root: state.db at 0, and the
+# per-profile homes at profiles/<name>/state.db = 3. Deeper than that are
+# third-party trees (venvs, node_modules) whose DBs are library data, not
+# agent state — and the hermes-agent subtree is excluded from snapshots by
+# default anyway, so shadow-copying it would be pure waste.
+SHADOW_SCAN_DEPTH = 3
+SHADOW_SKIP_DIRS = frozenset({
+    SHADOW_DIRNAME, "hermes-agent", "node_modules", "venv", ".venv",
+    "__pycache__", ".git", "site-packages", "browser_screenshots",
+    "image_cache", "audio_cache", "checkpoints", "snapshots", ".cache",
+})
 
 RESTIC_BINARY = "restic"
 
@@ -93,12 +103,26 @@ RESTIC_BINARY = "restic"
 def plugin_data_dir() -> Path:
     """`<hermes home>/plugin-data/hermes-backup/`, created on demand.
 
-    Resolves the active profile's home on every call (profile-safe); imported
-    lazily so the module imports cleanly outside a running Hermes (tests).
+    Under Hermes: the core helper (resolves the active profile on every call,
+    profile-safe). Standalone callers (``cycle.py`` under systemd, pytest)
+    lack the core module: fall back to ``$HERMES_HOME``/``~/.hermes`` so the
+    scheduler entry point keeps the same layout it had inside Hermes.
     """
-    from plugins.plugin_storage import plugin_data_dir as _pdd
+    try:
+        from plugins.plugin_storage import plugin_data_dir as _pdd
 
-    return _pdd(PLUGIN_ID)
+        return _pdd(PLUGIN_ID)
+    except Exception:
+        pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    root = home / "plugin-data" / PLUGIN_ID
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 # ── secrets (catalog rule 11) ────────────────────────────────────────────────
@@ -380,8 +404,13 @@ def log_path() -> Path:
     return plugin_data_dir() / LOG_FILENAME
 
 
-def log_append(line: str) -> None:
-    """Append one verdict/detail line, with a size guard (bounded rotation)."""
+def log_append(line: str, stamp: bool = True) -> None:
+    """Append one verdict/detail line, with a size guard (bounded rotation).
+
+    ``stamp=False`` writes the line verbatim — used for the reference
+    ``DRILL <date> <verdict> driver=<who>`` format, which is NOT a
+    bracketed-cycle verdict and must not gain a second date prefix.
+    """
     try:
         path = log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -392,9 +421,10 @@ def log_append(line: str) -> None:
             tmp = path.with_suffix(".tmp")
             tmp.write_bytes(keep)
             os.replace(tmp, path)
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        if stamp:
+            line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}"
         with open(path, "a", encoding="utf-8") as f:
-            f.write(f"[{stamp}] {line}\n")
+            f.write(f"{line}\n")
     except OSError as exc:
         logger.warning("hermes-backup: could not append to log: %s", exc)
 
@@ -449,7 +479,7 @@ def _stamp_epoch(stamp: str) -> Optional[int]:
 def append_drill_line(verdict: str, driver: str = "agent") -> None:
     verdict = verdict if verdict in ("PASS", "FAIL") else "FAIL"
     driver = (driver or "agent").strip().replace("\n", " ")[:64] or "agent"
-    log_append(f"DRILL {time.strftime('%Y-%m-%d')} {verdict} driver={driver}")
+    log_append(f"DRILL {time.strftime('%Y-%m-%d')} {verdict} driver={driver}", stamp=False)
 
 
 # ── snapshot queries (all --no-lock) ────────────────────────────────────────
@@ -554,35 +584,31 @@ def restic_dump(leg: Leg, snapshot_id: str, path: str) -> ResticResult:
 
 # ── hot SQLite shadow copies ─────────────────────────────────────────────────
 def discover_sqlite_dbs(source: Path) -> list[Path]:
-    """Hot databases: *.db/*.sqlite/*.sqlite3 within SCAN_DEPTH of the source
-    root (the Hermes home's hot DBs: ``state.db``, ``profiles/*/state.db``)."""
+    """Hot databases: *.db/*.sqlite/*.sqlite3 within SHADOW_SCAN_DEPTH of the
+    source root (the Hermes home's hot DBs: ``state.db``,
+    ``profiles/<name>/state.db``), skipping cache/venv/third-party subtrees."""
     found: list[Path] = []
     if not source.is_dir():
         return found
     source = source.resolve()
-    bases = [(0, source)]
-    try:
-        bases += [(1, source / name) for name in sorted(os.listdir(source))
-                  if (source / name).is_dir()]
-    except OSError:
-        pass
-    for depth, base in bases:
-        if depth > SHADOW_SCAN_DEPTH:
-            break
+    stack: list[tuple[Path, int]] = [(source, 0)]
+    while stack:
+        base, depth = stack.pop()
         try:
-            for entry in sorted(os.listdir(base)):
-                candidate = base / entry
-                if not candidate.is_file() or candidate.suffix.lower() not in SQLITE_SUFFIXES:
-                    continue
-                if SHADOW_DIRNAME in candidate.parts:
-                    continue
-                found.append(candidate)
+            entries = sorted(os.listdir(base))
         except OSError:
             continue
-    # de-dup + stable order
-    seen: set[Path] = set()
-    ordered = [p for p in sorted(set(found)) if not (p in seen or seen.add(p))]
-    return ordered
+        for entry in entries:
+            candidate = base / entry
+            rel_parts = candidate.relative_to(source).parts
+            if SHADOW_SKIP_DIRS & set(rel_parts):
+                continue
+            if candidate.is_dir():
+                if depth < SHADOW_SCAN_DEPTH:
+                    stack.append((candidate, depth + 1))
+            elif candidate.is_file() and candidate.suffix.lower() in SQLITE_SUFFIXES:
+                found.append(candidate)
+    return sorted(set(found))
 
 
 def stage_shadow_dbs(source: Optional[Path]) -> dict:
@@ -657,7 +683,8 @@ def _leg_backup(leg: Leg, cfg: Config, extra_excludes: Optional[list[str]] = Non
     result = leg.run(argv, timeout=TIMEOUTS["backup"])
     duration = round(time.time() - started, 1)
     if result.timed_out:
-        return {"leg": leg.leg_id, "verdict": "fail", "reason": result.stderr,
+        return {"leg": leg.leg_id, "verdict": "fail",
+                "reason": scrub(result.stderr or "timed out", leg.secrets),
                 "duration_seconds": duration}
     snapshot_id = None
     bytes_processed = None
@@ -673,7 +700,7 @@ def _leg_backup(leg: Leg, cfg: Config, extra_excludes: Optional[list[str]] = Non
                "duration_seconds": duration}
     else:
         out = {"leg": leg.leg_id, "verdict": "fail",
-               "reason": _restic_error_text(result), "duration_seconds": duration}
+               "reason": _restic_error_text(result, leg.secrets), "duration_seconds": duration}
     if bytes_processed is not None:
         out["bytes_processed"] = bytes_processed
     return out
@@ -713,9 +740,11 @@ def _parse_backup_json(stdout: str) -> tuple[Optional[str], Optional[int]]:
     return snapshot_id, total
 
 
-def _restic_error_text(result: ResticResult, limit: int = 400) -> str:
+def _restic_error_text(result: ResticResult, secrets: Optional[Secrets] = None,
+                       limit: int = 400) -> str:
+    """Last restic output line as a scrubbed, bounded reason string."""
     text = (result.stderr or result.stdout or "").strip()
-    text = scrub(text.splitlines()[-1] if text else f"restic exit code {result.rc}")
+    text = scrub(text.splitlines()[-1] if text else f"restic exit code {result.rc}", secrets)
     return text[:limit]
 
 
@@ -728,7 +757,7 @@ def _leg_forget(leg: Leg, cfg: Config) -> dict:
             "--keep-last", str(max(1, int(keep_last)))]
     result = leg.run(argv, timeout=TIMEOUTS["forget"])
     return {"leg": leg.leg_id, "pruned": result.ok,
-            "reason": None if result.ok else _restic_error_text(result)}
+            "reason": None if result.ok else _restic_error_text(result, leg.secrets)}
 
 
 def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
@@ -794,10 +823,11 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
                                                      "reason": scrub(str(exc), secrets)[:200]}
                 local_leg = next((leg for leg in wanted if leg.leg_id == "local"), None)
                 if local_leg and _repo_state(local_leg) == "ready":
-                    sample_result = _summarize_check(restic_check(local_leg, sample_pct=2))
+                    sample_result = _summarize_check(restic_check(local_leg, sample_pct=2),
+                                                     local_leg.secrets)
             r2_leg = next((leg for leg in wanted if leg.leg_id == "r2"), None)
             if r2_leg and _repo_state(r2_leg) == "ready":
-                structural["r2"] = _summarize_check(restic_check(r2_leg))
+                structural["r2"] = _summarize_check(restic_check(r2_leg), r2_leg.secrets)
         elif throttled:
             detail["prune_note"] = "no wanted legs; prune skipped"
 
@@ -825,11 +855,11 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
             pass
 
 
-def _summarize_check(result: ResticResult) -> dict:
+def _summarize_check(result: ResticResult, secrets: Optional[Secrets] = None) -> dict:
     return {"ok": result.ok, "rc": result.rc,
             "detail": scrub((result.stderr or result.stdout or "").strip().splitlines()[-1]
                             if (result.stderr or result.stdout).strip()
-                            else f"restic exit {result.rc}")[:200],
+                            else f"restic exit {result.rc}", secrets)[:200],
             "timed_out": result.timed_out}
 
 
@@ -902,8 +932,14 @@ def validate_restore_path(path: str, cfg: Config) -> Path:
 
 def restore_path(cfg: Optional[Config] = None, path: str = "", leg_id: str = "local",
                  snapshot_id: str = "", target_dir: str = "") -> dict:
-    """Restore a path (never over the live tree) into scratch and verify it
-    byte-for-byte against the live counterpart."""
+    """Restore a path (never over the live tree) into scratch.
+
+    Hard guarantees: restic's own integrity (``--verify`` — restored bytes
+    equal the snapshot content), path confinement, scratch-first. The
+    ``matches_live`` comparison is INFORMATIONAL, never a gate: a deleted
+    file has no live counterpart (``null``), and a damaged file is SUPPOSED
+    to differ — the restore is the repair.
+    """
     cfg = cfg or load_config()
     source = validate_restore_path(path, cfg)
     leg = get_leg(cfg, leg_id)
@@ -916,15 +952,19 @@ def restore_path(cfg: Optional[Config] = None, path: str = "", leg_id: str = "lo
         scratch = Path(target_dir) if target_dir else _scratch_dir()
         scratch.mkdir(parents=True, exist_ok=True)
         result = leg.run(["restic", "restore", snap["short_id"], "--include", str(source),
-                          "--target", str(scratch)], timeout=TIMEOUTS["restore"],
-                         allow_no_lock=True)
+                          "--target", str(scratch), "--verify"],
+                         timeout=TIMEOUTS["restore"], allow_no_lock=True)
         if not result.ok:
-            return {"ok": False, "error": _restic_error_text(result),
+            return {"ok": False, "error": _restic_error_text(result, leg.secrets),
                     "scratch_dir": str(scratch)}
         # restic recreates the absolute path structure under --target
-        restored_root = scratch.joinpath(*source.parts[1:])
+        restored_target = scratch.joinpath(*source.parts[1:])
+        if restored_target.is_dir():
+            candidates = sorted(restored_target.rglob("*"))
+        else:
+            candidates = [restored_target]  # a single-file restore
         files = []
-        for restored in sorted(restored_root.rglob("*")):
+        for restored in candidates:
             if not restored.is_file():
                 continue
             live = Path("/") / restored.relative_to(scratch)
@@ -932,15 +972,25 @@ def restore_path(cfg: Optional[Config] = None, path: str = "", leg_id: str = "lo
                      "size_bytes": restored.stat().st_size,
                      "sha256": _sha256(restored),
                      "live_sha256": _sha256(live) if live.is_file() else None,
-                     "matches_live": None}
+                     "matches_live": None, "reason": None}
             if live.is_file():
                 entry["matches_live"] = entry["sha256"] == entry["live_sha256"]
+                if not entry["matches_live"]:
+                    entry["reason"] = ("expected: live file differs from snapshot "
+                                       "— the restore is the repair")
+            else:
+                entry["reason"] = "live counterpart missing (deleted since snapshot?)"
             files.append(entry)
         return {"ok": True, "leg": leg_id, "snapshot_id": snap["short_id"],
                 "snapshot_time_epoch": snap.get("time_epoch"),
+                "restic_verified": True,
                 "scratch_dir": str(scratch), "files": files,
-                "all_match": bool(files) and all(f["matches_live"] for f in files)
-                if all(f["matches_live"] is not None for f in files) else None}
+                "summary": {
+                    "files_restored": len(files),
+                    "matching_live": sum(1 for f in files if f["matches_live"] is True),
+                    "differing_live": sum(1 for f in files if f["matches_live"] is False),
+                    "missing_live": sum(1 for f in files if f["matches_live"] is None),
+                }}
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     except Exception as exc:
@@ -1016,15 +1066,22 @@ def restore_commit(cfg: Optional[Config] = None, target_dir: str = "",
 
 
 # ── DR drill (the creativity edge, ported verbatim) ─────────────────────────
+DRILL_MAX_PICK_ATTEMPTS = 5
+
+
 def run_drill(cfg: Optional[Config] = None, deep: bool = False,
               file: str = "", driver: str = "agent", secrets: Optional[Secrets] = None) -> dict:
     """Prove restorability: snapshot ages both legs → structural checks →
     ``restic dump`` one small real file from EACH leg into scratch, byte-compare
-    vs live → PASS/FAIL per step → ``DRILL <date> <verdict> driver=<who>`` log line.
+    → PASS/FAIL per step → ``DRILL <date> <verdict> driver=<who>`` log line.
 
-    Steps strictly sequential; ``pgrep restic`` before each — never launch a
-    step into an already-locked repo. ``deep`` adds a full ``--read-data``
-    check of the local leg (loud warning: can take many minutes).
+    Verdict taxonomy: per-step PASS / FAIL / SKIP, plus ``file_pick_mismatch``
+    — a distinct NON-failure outcome for "the dumps came back fine but no
+    candidate could be verified against live". One mismatched file is never
+    evidence of a broken backup. Steps strictly sequential; ``pgrep restic``
+    before each — never launch a step into an already-locked repo. ``deep``
+    adds a full ``--read-data`` check of the local leg (loud warning: can
+    take many minutes).
     """
     cfg = cfg or load_config()
     secrets = secrets or Secrets.load()
@@ -1046,92 +1103,188 @@ def run_drill(cfg: Optional[Config] = None, deep: bool = False,
     all_legs = legs(cfg, secrets)
     ready = [leg for leg in all_legs if _repo_state(leg) == "ready"]
 
-    # (a) last snapshot age, both legs
+    # (a) last snapshot age, both legs (per-leg SKIP for legs that cannot run)
     def _ages() -> dict:
-        ages, ok = {}, True
+        ages: dict[str, Any] = {}
+        skip_count = fail_count = 0
+        latest: dict[str, Optional[dict]] = {}
         for leg in all_legs:
             if not leg.configured:
-                ages[leg.leg_id] = "not configured"
+                ages[leg.leg_id] = {"verdict": "SKIP", "reason": "leg not configured"}
+                skip_count += 1
             elif _repo_state(leg) != "ready":
-                ages[leg.leg_id] = f"not ready ({_repo_state(leg)})"
+                ages[leg.leg_id] = {"verdict": "SKIP", "reason": f"not ready ({_repo_state(leg)})"}
+                skip_count += 1
             else:
                 snap = latest_snapshot(leg)
+                latest[leg.leg_id] = snap
                 if not snap:
-                    ages[leg.leg_id] = "no snapshots"
-                    ok = False
+                    ages[leg.leg_id] = {"verdict": "FAIL", "reason": "no snapshots yet"}
+                    fail_count += 1
                 else:
-                    age = int(time.time()) - (snap.get("time_epoch") or 0)
-                    ages[leg.leg_id] = {"snapshot_id": snap["short_id"],
-                                        "age_seconds": age}
-        return {"verdict": "PASS" if ok else "FAIL", "ages": ages}
+                    ages[leg.leg_id] = {"verdict": "PASS", "snapshot_id": snap["short_id"],
+                                        "age_seconds": int(time.time()) - (snap.get("time_epoch") or 0)}
+        if fail_count:
+            verdict = "FAIL"
+        elif skip_count == len(all_legs):
+            verdict = "SKIP"  # nothing drilled at all
+        else:
+            verdict = "PASS"
+        return {"verdict": verdict, "ages": ages, "latest": latest}
 
-    step("snapshot_age_both_legs", _ages)
+    ages_step = step("snapshot_age_both_legs", _ages)
+    latest_by_leg: dict[str, Optional[dict]] = ages_step.get("latest", {})
+    cutoff = min((s["time_epoch"] for s in latest_by_leg.values()
+                  if s and s.get("time_epoch")), default=None)
 
     # (b) structural checks (deep adds full --read-data on the local leg)
     def _checks() -> dict:
-        out, ok = {}, True
-        for leg in ready:
+        out: dict[str, Any] = {}
+        fail = skip = ran = 0
+        for leg in all_legs:
+            if not leg.configured or _repo_state(leg) != "ready":
+                out[leg.leg_id] = {"verdict": "SKIP", "reason": "leg not ready"}
+                skip += 1
+                continue
+            ran += 1
             is_deep = deep and leg.leg_id == "local"
             check = restic_check(leg, deep=is_deep)
-            out[leg.leg_id] = {"ok": check.ok, "deep": is_deep,
-                               "detail": _summarize_check(check)["detail"]}
-            ok = ok and check.ok
-        if not ready:
-            out["error"] = "no leg is ready (nothing to drill)"
-        for leg in all_legs:
-            if leg.configured and _repo_state(leg) != "ready" and leg.leg_id not in out:
-                out[leg.leg_id] = {"ok": False, "state": _repo_state(leg)}
-                ok = False
-        return {"verdict": "PASS" if ok else "FAIL", "checks": out}
+            out[leg.leg_id] = {"verdict": "PASS" if check.ok else "FAIL",
+                               "deep": is_deep,
+                               "detail": _summarize_check(check, leg.secrets)["detail"]}
+            if not check.ok:
+                fail += 1
+        if fail:
+            verdict = "FAIL"
+        elif not ran:
+            verdict = "SKIP"
+        else:
+            verdict = "PASS"
+        return {"verdict": verdict, "checks": out}
 
     step("structural_checks_both_legs", _checks)
     deep_warning = ("deep=true runs a FULL read of every byte on the local leg "
                     "— can take many minutes on large repositories") if deep else None
 
-    # (c) dump one small real file from each leg, byte-compare vs live
+    # (c) dump one small real file from each ready leg; byte-compare across
+    # legs AND vs live — with re-pick on live mismatch (file_pick_mismatch)
     def _dump_test() -> dict:
         source = cfg.source
-        target_rel = _drill_file(source, file)
-        if target_rel is None:
-            return {"verdict": "FAIL", "detail": f"no small real file found under {source} to dump-test"}
-        target = source / target_rel
-        results, ok = {}, True
-        for leg in ready:
-            dump = restic_dump(leg, _resolve_latest_snapshot(leg)["short_id"], str(target))
-            live_sha = _sha256(target)
-            if not dump.ok:
-                results[leg.leg_id] = {"ok": False, "detail": _restic_error_text(dump)}
-                ok = False
+        candidates = _drill_candidates(source, file)
+        if source is None:
+            return {"verdict": "SKIP", "detail": "no source configured"}
+        if not candidates:
+            return {"verdict": "SKIP",
+                    "detail": f"no small real file found under {source} to dump-test"}
+        dumpable_legs = [leg for leg in ready
+                         if (latest_by_leg.get(leg.leg_id) or {}).get("short_id")]
+        if not dumpable_legs:
+            return {"verdict": "SKIP", "detail": "no ready leg with snapshots to dump from"}
+        attempts: list[dict] = []
+        for rel in candidates[:DRILL_MAX_PICK_ATTEMPTS]:
+            target = source / rel
+            leg_results: dict[str, Any] = {}
+            dump_bytes: dict[str, bytes] = {}
+            hard_failure: dict[str, str] = {}
+            for leg in dumpable_legs:
+                short_id = (latest_by_leg.get(leg.leg_id) or {}).get("short_id") or ""
+                if not short_id:
+                    continue
+                dump = restic_dump(leg, short_id, str(target))
+                if not dump.ok:
+                    detail = _restic_error_text(dump, leg.secrets)
+                    if _dump_absence(detail):
+                        # the candidate simply is not in that snapshot
+                        # (excluded, or created after it) — re-pick
+                        leg_results[leg.leg_id] = {"ok": False, "absent": True,
+                                                   "detail": detail}
+                        continue
+                    leg_results[leg.leg_id] = {"ok": False, "detail": detail}
+                    hard_failure[leg.leg_id] = detail
+                    continue
+                data = dump.stdout.encode("utf-8", "surrogateescape")
+                dump_bytes[leg.leg_id] = data
+                leg_results[leg.leg_id] = {"ok": True, "file": str(target),
+                                           "size_bytes": len(data),
+                                           "sha256": _sha256_bytes(data)}
+            if hard_failure:
+                return {"verdict": "FAIL", "file": str(target), "legs": leg_results,
+                        "detail": "a ready leg could not read the file from its "
+                                  "snapshot — this IS a backup problem"}
+            if not dump_bytes:
+                # every leg: candidate absent from the snapshot → re-pick
+                attempts.append({"file": str(target), "verdict": "file_pick_mismatch",
+                                 "reason": "file not present in the snapshot "
+                                           "(excluded, or created after it)"})
                 continue
-            dump_sha = _sha256_bytes(dump.stdout.encode("utf-8", "surrogateescape"))
-            match = dump_sha is not None and dump_sha == live_sha
-            results[leg.leg_id] = {"ok": match, "file": str(target), "sha256": dump_sha,
-                                   "live_sha256": live_sha, "matches_live": match}
-            ok = ok and match
-        if not ready:
-            ok = False
-        return {"verdict": "PASS" if ok else "FAIL", "file": str(target),
-                "legs": results}
+            shas = {_sha256_bytes(data) for data in dump_bytes.values()}
+            cross_leg_match = len(shas) == 1 and None not in shas
+            live_bytes = _read_bytes(target)
+            live_sha = _sha256_bytes(live_bytes) if live_bytes is not None else None
+            matches_live = live_sha is not None and live_sha in shas
+            attempt = {"file": str(target), "legs": leg_results,
+                       "cross_leg_match": cross_leg_match,
+                       "live_exists": live_bytes is not None,
+                       "matches_live": matches_live if live_bytes is not None else None,
+                       "live_sha256": live_sha,
+                       "mtime_eligible": _mtime_eligible(target, cutoff)}
+            if cross_leg_match and matches_live:
+                attempt["verdict"] = "PASS"
+                return {"verdict": "PASS", "file": str(target), "attempt": attempt,
+                        "attempts": attempts}
+            attempts.append({**attempt, "verdict": "file_pick_mismatch"})
+        # dumps came back fine from every ready leg; no candidate verified
+        # against live — that is a PICK problem, not a backup problem
+        return {"verdict": "file_pick_mismatch", "attempts": attempts,
+                "detail": ("dumps succeeded from every ready leg but no candidate "
+                           "file could be verified against live — the verification "
+                           "file likely changed after the last snapshot. This is "
+                           "NOT evidence of a broken backup; pick a stable file "
+                           "or rerun after the next cycle.")}
 
     step("dump_and_byte_compare", _dump_test)
 
-    passed = all(s.get("verdict") == "PASS" for s in steps)
-    verdict = "PASS" if passed else "FAIL"
+    hard_fail = any(s.get("verdict") == "FAIL" for s in steps)
+    verdict = "FAIL" if hard_fail else "PASS"
     append_drill_line(verdict, driver)
     return {"verdict": verdict, "steps": steps, "deep": bool(deep),
             "deep_warning": deep_warning, "driver": driver, "now_epoch": int(time.time())}
 
 
-def _sha256_bytes(data: bytes) -> Optional[str]:
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
+_DUMP_ABSENCE_PATTERNS = ("does not exist", "no such file", "not found",
+                          "wrong path", "is not in the snapshot")
 
 
-def _drill_file(source: Optional[Path], override: str = "") -> Optional[str]:
-    """Deterministically pick one small real file (1B–256KB, depth ≤ 3) for
-    the dump test — ``config.yaml`` first when present."""
-    if source is None or not source.is_dir():
+def _dump_absence(detail: str) -> bool:
+    """True when a dump error means 'path not in that snapshot' (re-pick)
+    rather than a read/integrity failure (real backup problem)."""
+    lowered = (detail or "").lower()
+    return any(pattern in lowered for pattern in _DUMP_ABSENCE_PATTERNS)
+
+
+def _read_bytes(path: Path) -> Optional[bytes]:
+    try:
+        return path.read_bytes()
+    except OSError:
         return None
+
+
+def _mtime_eligible(path: Path, cutoff_epoch: Optional[int]) -> Optional[bool]:
+    """True when the file's mtime predates the snapshot being tested (i.e.
+    unchanged since then). None when there is no cutoff to compare against."""
+    if cutoff_epoch is None:
+        return None
+    try:
+        return int(path.stat().st_mtime) <= cutoff_epoch
+    except OSError:
+        return False
+
+
+def _drill_candidates(source: Optional[Path], override: str = "") -> list[str]:
+    """Small real files (1B–256KB, depth ≤ 3) ordered for the dump test —
+    ``config.yaml`` preferred, mtime-eligible candidates first."""
+    if source is None or not source.is_dir():
+        return []
     if override:
         candidate = Path(override)
         if not candidate.is_absolute():
@@ -1139,19 +1292,27 @@ def _drill_file(source: Optional[Path], override: str = "") -> Optional[str]:
         resolved = candidate.resolve()
         if not (is_within(resolved, source) and resolved.is_file()
                 and 0 < resolved.stat().st_size <= 256 * 1024):
-            return None
-        return str(resolved.relative_to(source))
-    preferred = source / "config.yaml"
-    if preferred.is_file() and 0 < preferred.stat().st_size <= 256 * 1024:
-        return "config.yaml"
+            return []
+        return [str(resolved.relative_to(source))]
+    eligible, rest = [], []
     for path in sorted(source.rglob("*")):
-        if path.is_file() and path.suffix.lower() not in SQLITE_SUFFIXES \
-                and SHADOW_DIRNAME not in path.parts and not path.is_symlink() \
-                and 0 < path.stat().st_size <= 256 * 1024:
-            rel = path.relative_to(source)
-            if len(rel.parts) <= 3:
-                return str(rel)
-    return None
+        if not (path.is_file() and path.suffix.lower() not in SQLITE_SUFFIXES
+                and SHADOW_DIRNAME not in path.parts and not path.is_symlink()
+                and 0 < path.stat().st_size <= 256 * 1024):
+            continue
+        rel = path.relative_to(source)
+        if len(rel.parts) > 3:
+            continue
+        if path.name == "config.yaml" and path.parent == source:
+            eligible.insert(0, str(rel))
+        else:
+            rest.append(str(rel))
+    return eligible + rest
+
+
+def _sha256_bytes(data: bytes) -> Optional[str]:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
 
 
 # ── timer state (numeric epochs; renderer does the math) ─────────────────────
@@ -1305,6 +1466,8 @@ def systemd_unit_text(interval_minutes: int) -> dict:
         "#   HERMES_BACKUP_R2_ACCESS_KEY / HERMES_BACKUP_R2_SECRET_KEY (offsite leg)\n"
         "#   HERMES_BACKUP_SOURCE / HERMES_BACKUP_LOCAL_REPO / HERMES_BACKUP_R2_ENDPOINT /\n"
         "#   HERMES_BACKUP_R2_BUCKET / HERMES_BACKUP_INTERVAL_MINUTES (optional overrides)\n"
+        f"#   HERMES_HOME (only for standalone scheduler runs: the Hermes home that\n"
+        f"#     holds plugin-data/{PLUGIN_ID}; leave unset when run inside Hermes)\n"
         "# The cycle script reads ONLY its process env (injected here); it never\n"
         "# reads this or any other credential file directly.\n"
     )

@@ -142,7 +142,7 @@ BACKUP_RESTORE_COMMIT_SCHEMA = _schema(
     }, "confirm": {
         "type": "boolean",
         "description": "Must be explicitly true to overwrite live files. Anything else is refused.",
-    }},
+    }, "source_path": SOURCE_PARAM},
     ["target_dir", "confirm"],
 )
 
