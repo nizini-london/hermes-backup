@@ -24,3 +24,77 @@ def test_setup_install_requires_literal_true(data_root, tmp_path, monkeypatch):
     parsed = json.loads(out)
     assert parsed["ok"] is True, out
     assert "installed" not in parsed, parsed  # old code: truthy string installed
+
+
+# ── fix round 1, P1#7: the launchd job gets its settings via the plist ───────
+
+def test_launchd_plist_carries_environment_variables(data_root, tmp_path,
+                                                     monkeypatch):
+    """P1#7: the generated launchd job starts cycle.py with NO environment —
+    every cycle would fail (source unresolvable, no secrets). The plist now
+    carries EnvironmentVariables (HERMES_HOME, source, repos, cadence) plus a
+    RESTIC_PASSWORD_FILE reference — never an inlined secret value."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fake-hermes"))
+    cfg = make_cfg(tmp_path, source=tmp_path / "hermes-home",
+                   local_repo=tmp_path / "backup-repo")
+    out = engine.launchd_plist_text(7, cfg=cfg)
+    import plistlib
+    plist = plistlib.loads(out["plist"].encode())
+    assert plist["Label"] == engine.LAUNCHD_LABEL
+    env = plist.get("EnvironmentVariables") or {}
+    assert env.get("HERMES_HOME") == str(tmp_path / "fake-hermes")
+    assert env.get("HERMES_BACKUP_SOURCE") == str(tmp_path / "hermes-home")
+    assert env.get("HERMES_BACKUP_LOCAL_REPO") == str(tmp_path / "backup-repo")
+    assert env.get("HERMES_BACKUP_INTERVAL_MINUTES") == "7"
+    pw_file = env.get("RESTIC_PASSWORD_FILE") or ""
+    assert pw_file.endswith("restic-password") and pw_file.startswith("/")
+    # secrets are never inlined into the plist
+    from conftest import TEST_PASSWORD
+    assert TEST_PASSWORD not in out["plist"]
+    assert "HERMES_BACKUP_R2_ACCESS_KEY" not in out["plist"]
+    assert "HERMES_BACKUP_R2_SECRET_KEY" not in out["plist"]
+    assert out["setup_steps"] and any("chmod 600" in s for s in out["setup_steps"])
+
+
+def test_launchd_plist_degrades_loudly_when_config_incomplete(data_root, tmp_path,
+                                                              monkeypatch):
+    """P1#7: with nothing configured the plist generation says so loudly —
+    the job would refuse every cycle otherwise."""
+    import sys
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
+    cfg = make_cfg(tmp_path)  # no source, no repo
+    out = engine.launchd_plist_text(5, cfg=cfg)
+    warnings = out.get("warnings") or []
+    assert any("source" in w.lower() for w in warnings), warnings
+    assert any("repository" in w.lower() for w in warnings), warnings
+
+
+def test_launchd_plist_warns_offsite_keys_not_carried(data_root, tmp_path,
+                                                      monkeypatch):
+    """P1#7: the offsite S3 keys cannot ride the plist (secrets are never
+    inlined) — setup says so loudly when the r2 leg is configured."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "fake-hermes"))
+    cfg = engine.Config(source_path=str(tmp_path / "home"),
+                        r2_endpoint="https://acct.r2.cloudflarestorage.com",
+                        r2_bucket="bucket")
+    out = engine.launchd_plist_text(5, cfg=cfg)
+    warnings = out.get("warnings") or []
+    assert any("S3" in w or "offsite" in w.lower() for w in warnings), warnings
+
+
+def test_secrets_load_honors_referenced_password_file(data_root, tmp_path,
+                                                      monkeypatch):
+    """P1#7: RESTIC_PASSWORD_FILE (a PATH, never a value) feeds the repo
+    password when the config_schema secret is absent; the env secret wins
+    when both exist. This is the launchd contract."""
+    from conftest import TEST_PASSWORD
+    pw_file = tmp_path / "restic-password"
+    pw_file.write_text(TEST_PASSWORD + "\n")
+    monkeypatch.delenv("HERMES_BACKUP_RESTIC_PASSWORD", raising=False)
+    monkeypatch.delenv("RESTIC_PASSWORD_FILE", raising=False)
+    assert engine.Secrets.load().restic_password == ""
+    monkeypatch.setenv("RESTIC_PASSWORD_FILE", str(pw_file))
+    assert engine.Secrets.load().restic_password == TEST_PASSWORD
+    monkeypatch.setenv("HERMES_BACKUP_RESTIC_PASSWORD", "env-wins-password-123")
+    assert engine.Secrets.load().restic_password == "env-wins-password-123"

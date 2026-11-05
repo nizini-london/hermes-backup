@@ -194,7 +194,7 @@ def _do_setup(args, cfg=None) -> str:
         for leg_id in targets:
             out["init"][leg_id] = engine.init_repo(cfg, leg_id)
     out["systemd"] = engine.systemd_unit_text(interval or cfg.interval_minutes)
-    out["launchd"] = engine.launchd_plist_text(interval or cfg.interval_minutes)
+    out["launchd"] = engine.launchd_plist_text(interval or cfg.interval_minutes, cfg=cfg)
     out["cron_one_liner"] = engine.cron_one_liner(interval or cfg.interval_minutes)
     out["install_note"] = ("Files above are proposals only. Pass install=true (after the "
                            "user approves) to write and enable the systemd user timer; on "

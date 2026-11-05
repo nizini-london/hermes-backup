@@ -20,7 +20,10 @@ table) to a plugin engine:
   bound, so a fixed small tail intermittently misses every verdict).
 
 Secrets are never logged, never returned, and never read from credential
-files. Any text that leaves this module passes through ``scrub()``.
+files — the single exception is the standalone scheduler's
+``RESTIC_PASSWORD_FILE`` (the launchd plist references the file; the engine
+reads only that path, only in ``Secrets.load``, and never logs the value).
+Any text that leaves this module passes through ``scrub()``.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import subprocess
 import tempfile
 import time
 from contextlib import closing
+from xml.sax.saxutils import escape as xml_escape
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -155,7 +159,20 @@ class Secrets:
 
     @classmethod
     def load(cls) -> "Secrets":
-        return cls(**{k: get_secret(v) for k, v in SECRET_ENV_NAMES.items()})
+        data = {k: get_secret(v) for k, v in SECRET_ENV_NAMES.items()}
+        if not data["restic_password"]:
+            # launchd contract (fix round 1, P1#7): the scheduler plist cannot
+            # inline secret values, so it references a password FILE via
+            # RESTIC_PASSWORD_FILE (restic's own native variable). This is the
+            # engine's only file-based credential read: the path comes from
+            # the init system's env, the value is never logged nor returned.
+            pw_file = os.environ.get("RESTIC_PASSWORD_FILE") or ""
+            if pw_file:
+                try:
+                    data["restic_password"] = Path(pw_file).read_text().strip()
+                except OSError:
+                    pass  # leg state reports "no-password" — loud, not silent
+        return cls(**data)
 
 
 # ── scrubbing: secret values / names never leave the engine ─────────────────
@@ -1415,6 +1432,10 @@ def _sha256_bytes(data: bytes) -> Optional[str]:
 TIMER_UNIT = "hermes-backup.timer"
 SERVICE_UNIT = "hermes-backup.service"
 LAUNCHD_LABEL = "com.hermes-backup.cycle"
+# launchd cannot inline secrets: the plist references THIS file (restic's
+# native RESTIC_PASSWORD_FILE), the human creates it (chmod 600), and
+# Secrets.load reads it only in standalone scheduler mode. P1#7, fix round 1.
+RESTIC_PASSWORD_FILE_PATH = "~/.config/hermes-backup/restic-password"
 
 
 def timer_state() -> dict:
@@ -1572,9 +1593,65 @@ def systemd_unit_text(interval_minutes: int) -> dict:
             "on_calendar": calendar}
 
 
-def launchd_plist_text(interval_minutes: int) -> dict:
+def _hermes_home_str() -> str:
+    """The Hermes home a standalone scheduler job must use (plugin-data layout)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(Path(get_hermes_home()).resolve())
+    except Exception:
+        return str(Path(os.environ.get("HERMES_HOME")
+                        or Path.home() / ".hermes").resolve())
+
+
+def launchd_plist_text(interval_minutes: int, cfg: Optional[Config] = None) -> dict:
+    """launchd job for macOS (fix round 1, Greptile P1#7).
+
+    launchd has no EnvironmentFile: the plist now carries the job's settings
+    in ``EnvironmentVariables`` (HERMES_HOME, source, repos, cadence) plus a
+    ``RESTIC_PASSWORD_FILE`` reference — a PATH, never an inlined secret
+    value. ``Secrets.load`` honors that reference in standalone mode. Config
+    gaps degrade LOUDLY via ``warnings``; ``setup_steps`` says exactly what a
+    human must do (create the chmod-600 password file, load the agent).
+    """
+    cfg = cfg or load_config()
     plugin_dir = Path(__file__).resolve().parent
     python = shutil.which("python3") or "/usr/bin/python3"
+    password_file = Path(RESTIC_PASSWORD_FILE_PATH).expanduser()
+
+    env_items: dict[str, str] = {
+        "HERMES_HOME": _hermes_home_str(),
+        "HERMES_BACKUP_INTERVAL_MINUTES": str(max(1, int(interval_minutes or 5))),
+        "RESTIC_PASSWORD_FILE": str(password_file),
+    }
+    source = cfg.source
+    if source is not None:
+        env_items["HERMES_BACKUP_SOURCE"] = str(source)
+    local_repo = cfg.leg("local")
+    if local_repo:
+        env_items["HERMES_BACKUP_LOCAL_REPO"] = str(local_repo)
+    r2_repo = cfg.leg("r2")
+    if r2_repo:
+        env_items["HERMES_BACKUP_R2_ENDPOINT"] = (cfg.r2_endpoint or "").strip().rstrip("/")
+        env_items["HERMES_BACKUP_R2_BUCKET"] = (cfg.r2_bucket or "").strip()
+
+    warnings: list[str] = []
+    if source is None:
+        warnings.append("no backup source resolved — the job will REFUSE every cycle "
+                        "(fix round 1 refuses CWD backups); set source_path in the "
+                        "plugin settings")
+    if not (local_repo or r2_repo):
+        warnings.append("no backup repository is configured — the job would fail "
+                        "with setup guidance every cycle; run backup_setup first")
+    if r2_repo:
+        warnings.append("the offsite S3 keys CANNOT ride the launchd plist (secrets "
+                        "are never inlined): under launchd the r2 leg will fail "
+                        "authentication — keep the local leg as primary or cover the "
+                        "offsite leg with the Hermes cron one-liner instead")
+
+    env_xml = "".join(
+        f"    <key>{xml_escape(k)}</key><string>{xml_escape(v)}</string>\n"
+        for k, v in sorted(env_items.items()))
     plist = (
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
@@ -1582,17 +1659,31 @@ def launchd_plist_text(interval_minutes: int) -> dict:
         "<plist version=\"1.0\">\n<dict>\n"
         f"  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n"
         "  <key>ProgramArguments</key><array>\n"
-        f"    <string>{python}</string>\n"
-        f"    <string>{plugin_dir / 'cycle.py'}</string>\n"
+        f"    <string>{xml_escape(python)}</string>\n"
+        f"    <string>{xml_escape(str(plugin_dir / 'cycle.py'))}</string>\n"
         "  </array>\n"
+        "  <key>EnvironmentVariables</key>\n"
+        "  <dict>\n"
+        f"{env_xml}"
+        "  </dict>\n"
         f"  <key>StartInterval</key><integer>{max(60, int(interval_minutes) * 60)}</integer>\n"
         "  <key>RunAtLoad</key><false/>\n"
         "  <key>StandardOutPath</key><string>/tmp/hermes-backup-cycle.out</string>\n"
         "  <key>StandardErrorPath</key><string>/tmp/hermes-backup-cycle.err</string>\n"
         "</dict>\n</plist>\n"
     )
+    setup_steps = [
+        f"create the password file (the plugin never writes it): mkdir -p "
+        f"{password_file.parent} && touch {password_file} && chmod 600 "
+        f"{password_file}, then paste the repository password into it",
+        f"save the plist as ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist",
+        f"load it: launchctl load ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist",
+    ]
     return {"plist": plist, "label": LAUNCHD_LABEL,
-            "path": f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"}
+            "path": f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist",
+            "environment_variables": env_items,
+            "password_file": str(password_file),
+            "setup_steps": setup_steps, "warnings": warnings}
 
 
 def cron_one_liner(interval_minutes: int) -> str:
