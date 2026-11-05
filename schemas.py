@@ -124,8 +124,11 @@ BACKUP_RESTORE_SCHEMA = _schema(
     }, "target_dir": {
         "type": "string",
         "description": (
-            "Optional scratch directory for the restore (inside the plugin "
-            "data dir). Default: a fresh timestamped scratch dir."),
+            "Optional scratch directory for the restore. Custom targets are "
+            "CONFINED to the plugin scratch root (<plugin-data>/scratch/): "
+            "they must resolve inside it (no symlink escapes), and must be "
+            "empty or new. Paths outside it — including '/' — are refused "
+            "before restic runs. Default: a fresh scratch dir under that root."),
     }},
     ["path"],
 )

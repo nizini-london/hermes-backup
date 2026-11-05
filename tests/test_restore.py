@@ -1,15 +1,20 @@
 """Restore safety: scratch-first, path containment, restic-verified bytes,
 informational matches_live (never a gate), confirm-gated commit with
-pre-commit safety copies."""
+pre-commit safety copies. Fix round 1 adds: custom target_dir confinement
+to the plugin scratch root, literal-true confirm."""
 
 import json
 
 import engine
 import tools
+from conftest import read_calls, snapshot_fixture, write_state
 
 
-def make_cfg(tmp_path, source, local_repo=None):
-    return engine.Config(source_path=str(source), local_repo=str(local_repo) if local_repo else "")
+def make_cfg(tmp_path, source, local_repo=None, r2=False):
+    return engine.Config(source_path=str(source),
+                         local_repo=str(local_repo) if local_repo else "",
+                         r2_endpoint="https://acct.r2.cloudflarestorage.com" if r2 else "",
+                         r2_bucket="bucket" if r2 else "")
 
 
 def cycle_ok(cfg):
@@ -171,3 +176,112 @@ def test_commit_skips_outside_source(data_root, tmp_path, source_tree):
     parsed = json.loads(out)
     assert parsed["ok"] is False  # nothing committable: the only file is outside source
     assert parsed["skipped"] and parsed["skipped"][0]["reason"] == "outside source tree"
+
+
+# ── fix round 1, P1#1: custom restore targets confined to the scratch root ───
+
+def _shimmed_r2(shim_state):
+    """Fake-ready r2 leg (shim answers every command with rc 0 — restic is
+    never really launched, so a red run cannot write anywhere)."""
+    write_state(shim_state, fake_all=True, snapshots=snapshot_fixture())
+
+
+def test_restore_refuses_target_outside_scratch_root(data_root, tmp_path,
+                                                     plugin_env, source_tree,
+                                                     restic_shim, shim_state,
+                                                     shim_calls):
+    """P1#1: target_dir='/' forwarded to 'restic restore --target' wrote files
+    at their original LIVE paths, bypassing confirm + the pre-commit safety
+    copy. Any target outside <plugin-data>/scratch/ is refused BEFORE restic."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    for bad in ("/", "/etc", str(tmp_path / "elsewhere-restore")):
+        out = tools.handle("backup_restore",
+                           {"path": str(source_tree / "config.yaml"), "target_dir": bad,
+                            "leg": "r2"},
+                           cfg=cfg)
+        parsed = json.loads(out)
+        assert parsed["ok"] is False, (bad, out)
+        assert "scratch" in parsed["error"], (bad, out)
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]], \
+        "restic restore must never be launched with an unconfined target"
+
+
+def test_restore_refuses_symlink_escape_target(data_root, tmp_path, plugin_env,
+                                               source_tree, restic_shim,
+                                               shim_state, shim_calls):
+    """P1#1: a symlink inside the scratch root pointing OUTSIDE is an escape —
+    refused; restic is never launched."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    link = engine.plugin_data_dir() / "scratch" / "escape"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(tmp_path, target_is_directory=True)  # EXISTING outside dir
+    out = tools.handle("backup_restore",
+                       {"path": str(source_tree / "config.yaml"), "target_dir": str(link),
+                        "leg": "r2"},
+                       cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False, out
+    assert "scratch" in parsed["error"], out
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]]
+
+
+def test_restore_refuses_nonempty_existing_target(data_root, tmp_path, plugin_env,
+                                                  source_tree, restic_shim,
+                                                  shim_state, shim_calls):
+    """P1#1: custom targets must be EMPTY or new — a dirty dir would let restic
+    merge restored bytes into unknown content."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    taken = engine.plugin_data_dir() / "scratch" / "taken"
+    (taken / "junk").mkdir(parents=True)
+    (taken / "junk" / "f").write_text("x")
+    out = tools.handle("backup_restore",
+                       {"path": str(source_tree / "config.yaml"), "target_dir": str(taken),
+                        "leg": "r2"},
+                       cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False, out
+    assert "empty" in parsed["error"], out
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]]
+
+
+def test_restore_accepts_custom_target_under_scratch_root(data_root, tmp_path,
+                                                          plugin_env, source_tree,
+                                                          restic_shim, shim_state,
+                                                          shim_calls):
+    """P1#1 positive: an empty, new dir inside <plugin-data>/scratch/ is a
+    valid custom target and is passed through to --target verbatim."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    target = engine.plugin_data_dir() / "scratch" / "my-restore"
+    out = tools.handle("backup_restore",
+                       {"path": str(source_tree / "config.yaml"), "target_dir": str(target),
+                        "leg": "r2"},
+                       cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out
+    assert parsed["scratch_dir"] == str(target)
+    restores = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]]
+    assert len(restores) == 1, restores
+    argv = restores[0]["argv"]
+    assert argv[argv.index("--target") + 1] == str(target)
+    assert "--verify" in argv
+
+
+def test_restore_default_target_is_fresh_dir_under_scratch_root(data_root,
+                                                                tmp_path,
+                                                                plugin_env,
+                                                                source_tree,
+                                                                restic_shim,
+                                                                shim_state):
+    """P1#1: the default (no target_dir) remains a fresh scratch dir — now
+    under the same <plugin-data>/scratch/ root."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    out = tools.handle("backup_restore", {"path": str(source_tree / "config.yaml"),
+                                          "leg": "r2"}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out
+    assert parsed["scratch_dir"].startswith(str(engine.plugin_data_dir() / "scratch"))

@@ -894,10 +894,49 @@ def _log_cycle(results: dict, verdict: str, wanted: list[Leg], detail: dict) -> 
 
 
 # ── restore + commit ─────────────────────────────────────────────────────────
+SCRATCH_ROOT_NAME = "scratch"
+
+
+def scratch_root() -> Path:
+    """The ONE directory custom restore targets may live under:
+    ``<plugin data dir>/scratch/`` (fix round 1, Greptile P1#1)."""
+    return plugin_data_dir() / SCRATCH_ROOT_NAME
+
+
 def _scratch_dir(base: Optional[Path] = None, prefix: str = "restore") -> Path:
-    root = base or (plugin_data_dir() / "restore-scratch")
+    root = base or scratch_root()
     root.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=root))
+
+
+def _resolve_custom_target(target_dir: str) -> Path:
+    """Validate a user-supplied custom restore target (fix round 1, P1#1).
+
+    ``restic restore --target <dir>`` recreates the snapshot's absolute path
+    structure UNDER that dir — an unconfined target (``/``) writes at the
+    original live paths, bypassing confirm and the pre-commit safety copy.
+    Custom targets therefore exist ONLY inside :func:`scratch_root`: resolved
+    (symlink escapes rejected), empty or new.
+    """
+    raw = Path(os.path.expanduser(target_dir))
+    if raw.is_symlink():
+        raise ValueError("target_dir is a symlink — refusing (custom targets must "
+                         "live inside the plugin scratch root)")
+    resolved = raw.resolve()
+    root = scratch_root()
+    root.mkdir(parents=True, exist_ok=True)
+    if not is_within(resolved, root):
+        raise ValueError(f"target_dir must be inside the plugin scratch root ({root}) "
+                         f"— refusing {target_dir!r}")
+    if resolved.exists():
+        if not resolved.is_dir():
+            raise ValueError(f"target_dir {target_dir} exists and is not a directory")
+        if any(resolved.iterdir()):
+            raise ValueError(f"target_dir must be empty or new — refusing to restore "
+                             f"into a dirty scratch dir ({target_dir})")
+    else:
+        resolved.mkdir(parents=True)
+    return resolved
 
 
 def is_within(child: Path, parent: Path) -> bool:
@@ -949,7 +988,9 @@ def restore_path(cfg: Optional[Config] = None, path: str = "", leg_id: str = "lo
     try:
         snap = _resolve_latest_snapshot(leg) if not snapshot_id else {
             "short_id": snapshot_id, "id": snapshot_id, "time": "", "time_epoch": None}
-        scratch = Path(target_dir) if target_dir else _scratch_dir()
+        # P1#1 (fix round 1): custom targets are confined to the plugin
+        # scratch root; the default remains a fresh scratch dir.
+        scratch = _resolve_custom_target(target_dir) if target_dir else _scratch_dir()
         scratch.mkdir(parents=True, exist_ok=True)
         result = leg.run(["restic", "restore", snap["short_id"], "--include", str(source),
                           "--target", str(scratch), "--verify"],
