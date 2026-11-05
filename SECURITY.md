@@ -9,8 +9,8 @@
 
 ## Reporting a vulnerability
 
-Open a [private security advisory](https://github.com/shaun-xenon/hermes-backup/security/advisories/new)
-or email the maintainer directly. Please do not open a public issue for
+Open a [private security advisory](https://github.com/nizini-london/hermes-backup/security/advisories/new)
+or email [Shaun Xenon](mailto:shaun@nizini.com) directly. Please do not open a public issue for
 exploitable behavior.
 
 Please include: affected tool (`backup_*`), reproduction steps, and the
