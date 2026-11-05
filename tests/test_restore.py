@@ -334,3 +334,47 @@ def test_restore_default_target_is_fresh_dir_under_scratch_root(data_root,
     parsed = json.loads(out)
     assert parsed["ok"] is True, out
     assert parsed["scratch_dir"].startswith(str(engine.plugin_data_dir() / "scratch"))
+
+
+def test_commit_error_enumerates_already_replaced_files(data_root, tmp_path,
+                                                        plugin_env,
+                                                        source_tree,
+                                                        local_repo,
+                                                        monkeypatch):
+    """QA N-8: a mid-loop OSError in restore_commit (say, the second file's
+    copy fails) surfaced a bare error — the caller could not tell WHICH files
+    were already replaced over live, nor that the pre-commit safety copies
+    exist for manual rollback. The error result now carries the enumeration
+    AND the safety snapshot."""
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    cycle_ok(cfg)
+    (source_tree / "config.yaml").write_text("drift-1\n")
+    (source_tree / "notes.md").write_text("drift-2\n")
+
+    out = tools.handle("backup_restore", {"path": str(source_tree)}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out  # whole-tree restore into scratch
+
+    real_copy2 = engine.shutil.copy2
+    live_copies = {"n": 0}
+
+    def flaky(src, dst, *args, **kwargs):
+        if str(dst).startswith(str(source_tree)):
+            live_copies["n"] += 1
+            if live_copies["n"] == 2:  # second LIVE replacement fails
+                raise OSError("simulated disk full mid-commit")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(engine.shutil, "copy2", flaky)
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": parsed["scratch_dir"], "confirm": True}, cfg=cfg)
+    res = json.loads(out)
+    assert res["ok"] is False, out
+    assert "Already replaced" in res["error"], res  # the enumeration, in words
+    assert len(res.get("committed") or []) == 1, res  # exactly one replacement made it
+    replaced = res["committed"][0]["path"]
+    assert replaced in res["error"], res            # named in the error text
+    assert replaced.startswith(str(source_tree)), res
+    assert "simulated disk full" in res["error"], res
+    assert "Safety copies" in res["error"] and "manual rollback" in res["error"], res
+    assert res.get("safety_snapshot", {}).get("dir"), res  # rollback pointer present

@@ -1257,7 +1257,20 @@ def restore_commit(cfg: Optional[Config] = None, target_dir: str = "",
             safety.append({"path": str(live), "safety_copy": str(safety_copy),
                            "sha256": _sha256(safety_copy)})
         live.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(restored, live)
+        try:
+            shutil.copy2(restored, live)
+        except OSError as exc:
+            # QA N-8 (fix round 2): a mid-loop failure must say exactly which
+            # files were already replaced over live — and that the pre-commit
+            # safety copies exist for manual rollback — not a bare error.
+            return {"ok": False,
+                    "error": (f"commit interrupted after {len(committed)} file(s): {exc}. "
+                              f"Already replaced: "
+                              f"{[c['path'] for c in committed] or 'none'}. "
+                              f"Safety copies of every replaced file are under "
+                              f"{safety_dir} for manual rollback."),
+                    "committed": committed, "skipped": skipped,
+                    "safety_snapshot": {"dir": str(safety_dir), "files": safety}}
         copied_sha = _sha256(live)
         committed.append({"path": str(live), "sha256": copied_sha,
                           "verified": copied_sha == restored_sha})
