@@ -385,12 +385,18 @@ function makeChip(ctx) {
       }
     }
     return jsx(Tip, {
-      content: 'Hermes Backup — snapshot age across the backup legs',
+      content: 'Hermes Backup — snapshot age; click to have the agent report full status',
       children: jsx('button', {
         type: 'button',
-        onClick: () => {
-          haptic('tap')
-        },
+        // QA N5: this used to be a dead button — onClick fired haptic('tap')
+        // and nothing else. It now routes through the same composer bridge
+        // as the pane buttons (sendBackupPrompt already haptics): the agent
+        // invokes backup_status, the widget never calls a tool, and with
+        // no composer open it fails closed with a warning toast.
+        onClick: () => sendBackupPrompt(
+          'Report the hermes-backup backup status: invoke the backup_status tool and summarize per-leg health, the last cycle and the last drill verdict.',
+          'Status request sent to the agent'
+        ),
         style: {
           display: 'inline-flex', alignItems: 'center', gap: 6,
           background: 'transparent', border: 'none', cursor: 'pointer',

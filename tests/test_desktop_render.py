@@ -94,9 +94,21 @@ export function Badge({ children }) { return children ?? null }
 export function Button({ children }) { return children ?? null }
 export function Tip({ children }) { return children ?? null }
 export const haptic = () => {}
+// Composer submissions and notifications are RECORDED (QA N5) so tests can
+// assert the chip's click wiring. A submit is recorded when the widget
+// CALLS the bridge — before submit() answers; COMPOSER_OK='false' models
+// "no composer open" (submit answers false), exercising the fail-closed
+// path: nothing is accepted for delivery and the widget must warn.
+globalThis.__SUBMITTED_PROMPTS__ = []
+globalThis.__NOTIFICATIONS__ = []
 export const host = {
-  composer: { submit: () => true },
-  notify: () => {},
+  composer: {
+    submit: (_ctx, prompt) => {
+      globalThis.__SUBMITTED_PROMPTS__.push(prompt ?? null)
+      return (process.env.COMPOSER_OK ?? 'true') === 'true'
+    },
+  },
+  notify: (note) => { globalThis.__NOTIFICATIONS__.push(note ?? null) },
 }
 export function useQuery() {
   const raw = globalThis.__BACKUP_STATUS_JSON__ ?? 'null'
@@ -183,19 +195,46 @@ function chipTones() {
     .map((t) => t.slice('@tone:'.length))
 }
 
+// QA N5: the chip must be a LIVE button. Find its onClick in the chip's
+// element tree (the text walk above collects text/tones; this pass collects
+// the handler) and fire it — submissions/notifications land in the globals
+// the SDK stub records.
+let chipClick = null
+;(() => {
+  const visit = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 10) return
+    if (Array.isArray(node)) { node.forEach((n) => visit(n, depth)); return }
+    // like real React (and flat()): invoke widget function components so
+    // their subtree materializes — the chip's root IS BackupChip, the
+    // onClick lives inside what it returns
+    if (typeof node.type === 'function' && !SDK_TYPES.has(node.type.name)) {
+      visit(node.type(node.props ?? {}), depth + 1)
+    }
+    if (node.props && typeof node.props.onClick === 'function') chipClick = node.props.onClick
+    if (node.props && node.props.children) visit(node.props.children, depth + 1)
+  }
+  visit(chipCfg.render(), 0)
+})()
+if (chipClick) chipClick()
+
 process.stdout.write(JSON.stringify({
   registered: registered.map((r) => r.id),
   pane: flat(paneCfg),
   chip: flat(chipCfg),
   chipTones: chipTones(),
   keyViolations: globalThis.__KEY_VIOLATIONS__ ?? [],
+  chipClicked: chipClick !== null,
+  submitted: globalThis.__SUBMITTED_PROMPTS__ ?? [],
+  notifications: globalThis.__NOTIFICATIONS__ ?? [],
 }))
 """
 
 
-def _render(tmp_path: Path, node: str, status: dict) -> dict:
+def _render(tmp_path: Path, node: str, status: dict,
+            extra_env: dict | None = None) -> dict:
     """Load plugin.js in a scratch node project and return the flattened
-    render output {registered, pane, chip}."""
+    render output {registered, pane, chip, chipClicked, submitted,
+    notifications}."""
     scratch = tmp_path / "node-render"
     shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True)
@@ -220,6 +259,7 @@ def _render(tmp_path: Path, node: str, status: dict) -> dict:
     shutil.copyfile(DESKTOP_PATH, scratch / "plugin-under-test.mjs")
     (scratch / "driver.mjs").write_text(DRIVER)
     env = dict(os.environ, BACKUP_STATUS_JSON=json.dumps(status))
+    env.update(extra_env or {})
     proc = subprocess.run(
         [node, str(scratch / "driver.mjs")],
         capture_output=True, text=True, env=env, cwd=str(scratch), timeout=60,
@@ -383,6 +423,49 @@ def test_p2_chip_tone_stalled_is_warn_not_bad(tmp_path, node_available):
         assert chip_tones == [f"@tone:{expected}"], f"{name}: {chip_tones}"
         if forbidden:
             assert f"@tone:{forbidden}" not in chip_tones, name
+
+
+def test_qa_n5_chip_click_prompts_the_agent_not_dead(tmp_path, node_available):
+    """QA N5 regression: the statusbar chip used to be a DEAD button —
+    onClick fired haptic('tap') and did nothing else. Clicking must submit
+    a backup_status prompt through the composer bridge (the agent invokes
+    the tool; the widget never calls one directly) and confirm via an
+    info notification."""
+    if node_available is None:
+        pytest.skip("node not available for the render harness")
+    legs = [{"leg": "local", "configured": True, "reachable": True,
+             "snapshot": {"id": "abcd1234", "epoch": int(time.time()) - 120}}]
+    out = _render(tmp_path, node_available, _chip_status(legs),
+                  extra_env={"COMPOSER_OK": "true"})
+    assert out["chipClicked"], "chip renders no clickable handler — dead button again"
+    assert len(out["submitted"]) == 1 and out["submitted"][0], (
+        f"chip click submitted nothing: {out['submitted']!r}")
+    prompt = out["submitted"][0]
+    assert "backup_status" in prompt, f"chip click prompt lost the tool name: {prompt!r}"
+    # The click's own toast is the LAST notification (registration toasts an
+    # earlier 'loaded' info) — success must confirm with info, never warn.
+    last = (out["notifications"] or [{}])[-1]
+    assert last.get("kind") == "info" and last.get("message") == "Status request sent to the agent", (
+        f"chip click did not confirm success: {out['notifications']!r}")
+
+
+def test_qa_n5_chip_click_fails_closed_without_composer(tmp_path, node_available):
+    """QA N5 companion: with no composer open (submit answers false) the
+    chip click must NOT claim success — it warns, the fail-closed contract
+    the pane buttons already follow. The recorded prompt is the ATTEMPT
+    through the bridge; the warning proves the refusal was honored."""
+    if node_available is None:
+        pytest.skip("node not available for the render harness")
+    legs = [{"leg": "local", "configured": True, "reachable": True,
+             "snapshot": {"id": "abcd1234", "epoch": int(time.time()) - 120}}]
+    out = _render(tmp_path, node_available, _chip_status(legs),
+                  extra_env={"COMPOSER_OK": "false"})
+    assert out["chipClicked"], "chip renders no clickable handler"
+    assert out["submitted"] and out["submitted"][0], (
+        f"chip click never attempted the composer bridge: {out['submitted']!r}")
+    last = (out["notifications"] or [{}])[-1]
+    assert last.get("kind") == "warning" and "No chat composer is open" in (last.get("message") or ""), (
+        f"submit refused but the click's own toast did not warn: {out['notifications']!r}")
 
 
 def test_p2_past_next_run_renders_due_now_not_zero(tmp_path, node_available):
