@@ -940,7 +940,10 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
         prune_results = {}
         sample_result = None
         structural = {}
-        if wanted and not results.get("skipped"):
+        # QA N-2 (fix round 2): the dead `not results.get("skipped")`
+        # condition is gone — "skipped" is a TOP-LEVEL cycle outcome, never a
+        # leg key inside `results`, so the old guard could never fire.
+        if wanted:
             if throttled and prune != "force" and _maintenance_done_this_window():
                 # P2#9 (fix round 1): the hourly pass already ran in this
                 # window — repeats are skipped, loudly.
