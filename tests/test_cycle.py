@@ -85,6 +85,29 @@ def test_shadow_fallback_for_broken_db(data_root, tmp_path, plugin_env, source_t
     assert "broken.db" in report["fallback_copied"], report
 
 
+def test_discover_skips_symlinked_dbs_and_dirs(data_root, tmp_path, source_tree):
+    """Fix round 1 P2: discover_sqlite_dbs FOLLOWED symlinks — a link to a
+    database outside the configured source was shadow-copied into the backup,
+    silently pulling in outside data. Symlinks are now skipped (lstat view)."""
+    from conftest import _mk_sqlite
+    outside = tmp_path / "outside-data"
+    outside.mkdir()
+    _mk_sqlite(outside / "evil.db")       # the escape target
+    _mk_sqlite(outside / "nested.db")     # behind a symlinked DIR
+    (source_tree / "link.db").symlink_to(outside / "evil.db")
+    (source_tree / "subdir-link").symlink_to(outside, target_is_directory=True)
+
+    found = engine.discover_sqlite_dbs(source_tree)
+    names = [p.name for p in found]
+    assert "evil.db" not in names, names
+    assert "nested.db" not in names, names
+    assert all(str(source_tree) in str(p) for p in found), found
+
+    report = engine.stage_shadow_dbs(source_tree)
+    staged = report["copied"] + report["fallback_copied"]
+    assert not any("evil" in f or "nested" in f for f in staged), staged
+
+
 def test_exit3_tolerated(data_root, tmp_path, plugin_env, source_tree, local_repo,
                          restic_shim, shim_state):
     """restic rc 3 = source files vanished = tolerated warning, not failure."""

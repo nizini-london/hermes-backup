@@ -639,6 +639,11 @@ def discover_sqlite_dbs(source: Path) -> list[Path]:
             rel_parts = candidate.relative_to(source).parts
             if SHADOW_SKIP_DIRS & set(rel_parts):
                 continue
+            if candidate.is_symlink():
+                # P2#10 (fix round 1): lstat view — a symlinked DB (or a
+                # symlinked dir) can point OUTSIDE the configured source;
+                # shadow-copying it silently pulled outside data in. Skip.
+                continue
             if candidate.is_dir():
                 if depth < SHADOW_SCAN_DEPTH:
                     stack.append((candidate, depth + 1))
