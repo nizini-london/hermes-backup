@@ -16,12 +16,24 @@
  * No app-internal DOM queries, no prototype patching, no eval, no script
  * tags, no raw window.hermesDesktop bridge. Colors come from the host theme
  * (StatusDot tones + var(--ui-*) with inherit fallbacks) — never hardcoded.
+ *
+ * jsx() contract (P1 #1 — regression-tested by tests/test_desktop_render.py):
+ * `jsx(type, props, key)` — children ALWAYS ride in `props.children`. The
+ * THIRD argument is the element key: text passed there renders an empty
+ * element. Every visible string in this file lives in props.children.
+ * tests/test_desktop_render.py renders this file in Node and asserts the
+ * text is actually present — `node --check` alone cannot catch this class
+ * of bug.
  */
 
 import { Badge, Button, StatusDot, Tip, haptic, host, useQuery } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'hermes-backup'
+// Client deadline for one /status call. Keep in sync with COLD_BUDGET_SECONDS
+// (22 s) in dashboard/plugin_api.py: the backend finishes every cold build
+// inside this deadline — a stalled leg reports "probing" instead of holding
+// the response past it and blanking the pane.
 const REST_TIMEOUT_MS = 30000
 
 // ---------------------------------------------------------------- helpers --
@@ -29,6 +41,21 @@ const REST_TIMEOUT_MS = 30000
 function ageStr(epoch, nowMs) {
   if (typeof epoch !== 'number' || !(epoch > 1e9)) return null
   const s = Math.max(0, Math.floor(nowMs / 1000 - epoch))
+  if (s < 90) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  if (s < 86400) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 86400)}d`
+}
+
+/**
+ * Time UNTIL a future timestamp (P2 #7): ageStr subtracts the timestamp
+ * from now and clamps negatives to zero — used on a future next-run time it
+ * showed "next ~0s" for every run. inStr subtracts the other way round.
+ */
+function inStr(epoch, nowMs) {
+  if (typeof epoch !== 'number' || !(epoch > 1e9)) return null
+  const s = Math.floor(epoch - nowMs / 1000)
+  if (s <= 0) return 'now'
   if (s < 90) return `${s}s`
   if (s < 3600) return `${Math.floor(s / 60)}m`
   if (s < 86400) return `${Math.floor(s / 3600)}h`
@@ -47,14 +74,22 @@ function fmtDate(epoch) {
 /**
  * Health for one leg. ok/warn/overdue are RENDERER math from the numeric
  * epoch against the configured interval (ok <= interval, warn <= 2x,
- * overdue past 2x); skip/fail are server facts (unconfigured / unreachable).
+ * overdue past 2x); skip/fail/stalled/empty are server facts (unconfigured
+ * / unreachable / probe did not finish in time / reachable but no snapshots
+ * yet — P2 #5: an empty repo is reachable, not down).
  */
 function legHealth(leg, intervalMin, nowMs) {
   if (!leg) return { tone: 'bad', state: 'unknown' }
   if (leg.configured === false) return { tone: 'muted', state: 'skip' }
-  if (!leg.reachable) return { tone: 'bad', state: 'fail' }
+  if (!leg.reachable) {
+    return leg.stalled
+      ? { tone: 'warn', state: 'stalled' }
+      : { tone: 'bad', state: 'fail' }
+  }
   const epoch = leg.snapshot && leg.snapshot.epoch
-  if (typeof epoch !== 'number' || !(epoch > 1e9)) return { tone: 'bad', state: 'fail' }
+  if (typeof epoch !== 'number' || !(epoch > 1e9)) {
+    return { tone: 'warn', state: 'empty' }
+  }
   const ageS = Math.max(0, nowMs / 1000 - epoch)
   if (ageS < intervalMin * 60) return { tone: 'good', state: 'ok' }
   if (ageS < intervalMin * 120) return { tone: 'warn', state: 'warn' }
@@ -87,16 +122,24 @@ function LegRow({ leg, intervalMin, nowMs }) {
   const { tone, state } = legHealth(leg, intervalMin, nowMs)
   const epoch = leg && leg.snapshot && leg.snapshot.epoch
   const age = ageStr(epoch, nowMs)
+  const primary = state === 'skip'
+    ? 'not configured'
+    : state === 'empty'
+      ? 'no snapshots yet'
+      : state === 'stalled'
+        ? 'probing…'
+        : age
+          ? `${age} ago`
+          : 'no snapshot'
   const detail = state === 'skip'
     ? 'not configured — run backup_setup'
     : state === 'fail'
       ? ((leg && leg.error) || 'unreachable')
-      : null
-  const primary = state === 'skip'
-    ? 'not configured'
-    : age
-      ? `${age} ago`
-      : 'no snapshot'
+      : state === 'stalled'
+        ? ((leg && leg.error) || 'probe still running — check again shortly')
+        : state === 'empty'
+          ? 'repository reachable — run backup_now for the first snapshot'
+          : null
   return jsxs('div', {
     style: rowStyle,
     children: [
@@ -104,10 +147,18 @@ function LegRow({ leg, intervalMin, nowMs }) {
         style: { display: 'flex', alignItems: 'center', gap: 10 },
         children: [
           jsx(StatusDot, { tone: tone }),
-          jsx('span', { style: labelStyle }, leg && leg.leg === 'r2' ? 'Offsite' : 'Local'),
-          jsx('span', { style: valueStyle }, primary),
-          jsx('span', { style: monoStyle }, (leg && leg.snapshot && leg.snapshot.id) || ''),
-          state === 'overdue' ? jsx(Badge, { variant: 'destructive' }, 'RPO overdue') : null,
+          jsx('span', {
+            style: labelStyle,
+            children: leg && leg.leg === 'r2' ? 'Offsite' : 'Local',
+          }),
+          jsx('span', { style: valueStyle, children: primary }),
+          jsx('span', {
+            style: monoStyle,
+            children: (leg && leg.snapshot && leg.snapshot.id) || '—',
+          }),
+          state === 'overdue'
+            ? jsx(Badge, { variant: 'destructive', children: 'RPO overdue' })
+            : null,
         ],
       }),
       detail
@@ -116,7 +167,8 @@ function LegRow({ leg, intervalMin, nowMs }) {
               marginTop: 2, marginLeft: 19, fontSize: '0.85em',
               color: 'var(--ui-text-tertiary, inherit)',
             },
-          }, detail)
+            children: detail,
+          })
         : null,
     ],
   })
@@ -127,8 +179,8 @@ function FactRow({ tone, label, children }) {
     style: rowStyle,
     children: [
       jsx(StatusDot, { tone: tone }),
-      jsx('span', { style: labelStyle }, label),
-      jsx('span', { style: { ...monoStyle, marginLeft: 'auto' } }, children),
+      jsx('span', { style: labelStyle, children: label }),
+      jsx('span', { style: { ...monoStyle, marginLeft: 'auto' }, children: children }),
     ],
   })
 }
@@ -163,11 +215,15 @@ function makePane(ctx) {
     if (q.isError) {
       return jsx('div', {
         style: { padding: 16, color: 'var(--ui-danger, var(--ui-text-secondary, inherit))' },
-      }, `backup status unavailable: ${q.error && q.error.message ? q.error.message : String(q.error)}`)
+        children: `backup status unavailable: ${q.error && q.error.message ? q.error.message : String(q.error)}`,
+      })
     }
     const st = q.data
     if (!st) {
-      return jsx('div', { style: { padding: 16, color: 'var(--ui-text-tertiary, inherit)' } }, 'loading…')
+      return jsx('div', {
+        style: { padding: 16, color: 'var(--ui-text-tertiary, inherit)' },
+        children: 'loading…',
+      })
     }
     const nowMs = Date.now()
     const intervalMin = typeof st.interval_minutes === 'number' && st.interval_minutes > 0
@@ -183,9 +239,16 @@ function makePane(ctx) {
       : schedule.kind === 'cron' && schedule.active
         ? 'cron active'
         : 'no schedule'
+    // P2 #7: the countdown is time UNTIL the next run (inStr) — ageStr
+    // clamps future deltas to 0 and showed "next ~0s" for every run.
     const nextIn = schedule.active && typeof schedule.next_run_epoch === 'number'
-      ? ageStr(schedule.next_run_epoch, nowMs)
+      ? inStr(schedule.next_run_epoch, nowMs)
       : null
+    const schedLabel = nextIn
+      ? nextIn === 'now'
+        ? `${schedText} · due now`
+        : `${schedText} · next ~${nextIn}`
+      : schedText
     const lastRun = st.last_run || null
     const runTone = !lastRun
       ? 'muted'
@@ -204,15 +267,21 @@ function makePane(ctx) {
         jsxs('div', {
           style: { display: 'flex', alignItems: 'baseline', gap: 10 },
           children: [
-            jsx('span', { style: { fontWeight: 700, fontSize: '1.05em' } }, 'Hermes Backup'),
-            jsx(Badge, { variant: 'outline' }, `RPO ${intervalMin}m`),
-            anyOverdue ? jsx(Badge, { variant: 'destructive' }, 'RPO overdue') : null,
+            jsx('span', {
+              style: { fontWeight: 700, fontSize: '1.05em' },
+              children: 'Hermes Backup',
+            }),
+            jsx(Badge, { variant: 'outline', children: `RPO ${intervalMin}m` }),
+            anyOverdue
+              ? jsx(Badge, { variant: 'destructive', children: 'RPO overdue' })
+              : null,
             jsx('span', {
               style: {
                 marginLeft: 'auto', fontSize: '0.85em',
                 color: 'var(--ui-text-tertiary, inherit)',
               },
-            }, nextIn ? `${schedText} · next ~${nextIn}` : schedText),
+              children: schedLabel,
+            }),
           ],
         }),
         legs.map((leg, i) => jsx(LegRow, { key: i, leg: leg, intervalMin: intervalMin, nowMs: nowMs })),
@@ -240,7 +309,8 @@ function makePane(ctx) {
                 'Run one snapshot cycle now with the hermes-backup plugin: invoke the backup_now tool and report the per-leg verdicts.',
                 'Backup request sent to the agent'
               ),
-            }, 'Backup now'),
+              children: 'Backup now',
+            }),
             jsx(Button, {
               variant: 'outline',
               size: 'sm',
@@ -248,7 +318,8 @@ function makePane(ctx) {
                 'Run the backup_drill tool from the hermes-backup plugin and report each step PASS/FAIL verdict.',
                 'Drill request sent to the agent'
               ),
-            }, 'Run drill'),
+              children: 'Run drill',
+            }),
           ],
         }),
       ],
@@ -306,7 +377,7 @@ function makeChip(ctx) {
         },
         children: [
           jsx(StatusDot, { tone: tone }),
-          jsx('span', {}, label),
+          jsx('span', { children: label }),
         ],
       }),
     })
