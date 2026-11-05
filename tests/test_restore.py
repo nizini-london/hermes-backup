@@ -178,6 +178,55 @@ def test_commit_skips_outside_source(data_root, tmp_path, source_tree):
     assert parsed["skipped"] and parsed["skipped"][0]["reason"] == "outside source tree"
 
 
+# ── fix round 1, P1#6: never commit over a live SQLite DB with WAL sidecars ──
+
+def test_commit_skips_sqlite_db_with_live_wal_sidecars(data_root, tmp_path, source_tree):
+    """P1#6: copying a snapshot-restored DB over a LIVE open SQLite database
+    (its -wal/-shm sidecars exist) can tear the DB — the commit refuses the
+    DB with quiesce guidance; unrelated files still commit."""
+    cfg = make_cfg(tmp_path, source_tree)
+    scratch = engine.plugin_data_dir() / "scratch" / "wal-restore"
+    live_rel = str(source_tree).lstrip("/")
+    db_dir = scratch / live_rel
+    db_dir.mkdir(parents=True)
+    (db_dir / "state.db").write_bytes(b"restored-db-bytes")
+    (db_dir / "notes.md").write_text("restored notes\n")
+    # live WAL sidecars prove the agent has this DB open right now
+    (source_tree / "state.db-wal").write_bytes(b"wal")
+    (source_tree / "state.db-shm").write_bytes(b"shm")
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out  # the non-DB commit path stays as designed
+    assert (source_tree / "notes.md").read_text() == "restored notes\n"
+    skipped = [s for s in parsed["skipped"] if "state.db" in s["path"]]
+    assert skipped, parsed
+    assert "WAL" in skipped[0]["reason"] and "quiesce" in skipped[0]["reason"]
+    with open(source_tree / "state.db", "rb") as f:
+        assert f.read(15) == b"SQLite format 3"  # live DB untouched
+
+
+def test_commit_fails_when_only_wal_guarded_db_in_scratch(data_root, tmp_path,
+                                                          source_tree):
+    """P1#6: when the ONLY scratch file is a WAL-guarded DB, the commit is a
+    refusal (nothing committed), with the quiesce reason carried in skipped."""
+    cfg = make_cfg(tmp_path, source_tree)
+    scratch = engine.plugin_data_dir() / "scratch" / "wal-only"
+    db_dir = scratch / str(source_tree).lstrip("/")
+    db_dir.mkdir(parents=True)
+    (db_dir / "state.db").write_bytes(b"restored-db-bytes")
+    (source_tree / "state.db-wal").write_bytes(b"wal")
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False, out
+    assert not parsed["committed"], parsed
+    skipped = [s for s in parsed["skipped"] if "state.db" in s["path"]]
+    assert skipped and "quiesce" in skipped[0]["reason"]
+    with open(source_tree / "state.db", "rb") as f:
+        assert f.read(15) == b"SQLite format 3"
+
+
 # ── fix round 1, P1#1: custom restore targets confined to the scratch root ───
 
 def _shimmed_r2(shim_state):

@@ -1121,6 +1121,20 @@ def restore_commit(cfg: Optional[Config] = None, target_dir: str = "",
         if not is_within(live, source):
             skipped.append({"path": str(live), "reason": "outside source tree"})
             continue
+        # P1#6 (fix round 1): never copy a snapshot over a LIVE open SQLite
+        # database — with -wal/-shm sidecars the overwrite can be torn or
+        # inconsistent. Refuse the DB with quiesce guidance; the non-DB
+        # commit path stays as designed.
+        if live.suffix.lower() in SQLITE_SUFFIXES:
+            wal = live.with_name(live.name + "-wal")
+            shm = live.with_name(live.name + "-shm")
+            if wal.exists() or shm.exists():
+                skipped.append({
+                    "path": str(live),
+                    "reason": "live SQLite database has WAL sidecars (-wal/-shm) "
+                              "present — quiesce the agent / close the database "
+                              "first, then retry the commit"})
+                continue
         restored_sha = _sha256(restored)
         if restored.is_file() and live.exists():
             live_rel = live.relative_to("/")
