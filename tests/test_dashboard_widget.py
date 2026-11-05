@@ -28,6 +28,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -258,6 +260,79 @@ def test_empty_repo_is_reachable_not_unreachable(tmp_path, monkeypatch):
     assert local["snapshot"] is None           # nothing backed up yet — a fact, not an error
     assert not local.get("error")              # and NOT "repository unreachable"
     assert "unreachable" not in json.dumps(payload)
+
+
+def test_cache_stamp_records_build_completion_time(tmp_path, monkeypatch):
+    """P2 #3 regression: the cache entry is stamped when the build FINISHES.
+    A slow _build_payload used to be recorded with its start time — born
+    already expired, so every later poll rebuilt during outages."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_config_snapshot", lambda: _settings_config({}))
+    monkeypatch.setattr(mod, "_secret", lambda name: None)
+
+    def slow_build(*_a, **_k):
+        time.sleep(1.2)
+        return {"plugin": mod.PLUGIN_ID, "legs": [], "interval_minutes": 5.0,
+                "last_run": None, "last_drill": None,
+                "schedule": {"kind": "none", "active": False, "next_run_epoch": None},
+                "now": int(time.time())}
+
+    monkeypatch.setattr(mod, "_build_payload", slow_build)
+
+    started = time.time()
+    payload = mod.status()
+    cache = mod._cache_path()
+    cached = json.loads(cache.read_text("utf-8"))
+    # Stamped at (or after) completion — not with the pre-build time.
+    assert cached["ts"] >= started + 1.0, (
+        f"cache ts {cached['ts']:.2f} predates build completion "
+        f"(started {started:.2f}) — slow build born expired")
+    assert cached["data"] == payload
+
+
+def test_concurrent_misses_share_one_build(tmp_path, monkeypatch):
+    """P2 #4 regression: concurrent cold misses are single-flight — exactly
+    one build runs, every caller gets the same payload, the cache file stays
+    valid JSON, and no shared fixed-name .tmp is left behind or torn."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_config_snapshot", lambda: _settings_config({}))
+    monkeypatch.setattr(mod, "_secret", lambda name: None)
+
+    calls = {"n": 0}
+    counter_lock = threading.Lock()
+
+    def slow_build(*_a, **_k):
+        with counter_lock:
+            calls["n"] += 1
+        time.sleep(0.5)
+        return {"plugin": mod.PLUGIN_ID, "legs": [], "interval_minutes": 5.0,
+                "last_run": None, "last_drill": None,
+                "schedule": {"kind": "none", "active": False, "next_run_epoch": None},
+                "now": int(time.time())}
+
+    monkeypatch.setattr(mod, "_build_payload", slow_build)
+
+    n_callers = 4
+    barrier = threading.Barrier(n_callers)
+    results = []
+
+    def poll():
+        barrier.wait()
+        results.append(mod.status())
+
+    threads = [threading.Thread(target=poll) for _ in range(n_callers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert calls["n"] == 1, f"built {calls['n']}x — concurrent misses raced"
+    assert len(results) == n_callers
+    assert all(r == results[0] and r["plugin"] == mod.PLUGIN_ID for r in results)
+    cache = mod._cache_path()
+    cached = json.loads(cache.read_text("utf-8"))  # still valid JSON (no torn write)
+    assert cached["data"] == results[0]
+    assert list(cache.parent.glob("*.tmp")) == []  # unique tmp per write, all replaced
 
 
 def test_last_run_verdict_survives_progress_flood(tmp_path, monkeypatch):

@@ -18,7 +18,10 @@ Catalog-contract rules this file holds:
   Renderers do the math themselves; restic's ISO strings carry up to 9
   fractional digits, which ``Date.parse`` cannot digest.
 - **60 s server-side cache** — chip + pane + any dashboard poller share one
-  cache file, so rapid polls never spawn restic subprocesses per tick.
+  cache file, so rapid polls never spawn restic subprocesses per tick. The
+  refresh is single-flight (concurrent misses share one build instead of
+  racing) and the cache entry is stamped when the build FINISHES, so a slow
+  build is not born already expired.
 - **Leg independence** — each leg is probed inside its own guard; one leg's
   failure or misconfiguration never gates or skips the other.
 - **Bounded cold budget** — a cold build must finish inside the desktop
@@ -44,6 +47,8 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -465,6 +470,13 @@ def _cache_path() -> Path:
     return _hermes_home() / "plugin-data" / PLUGIN_ID / "widget-status.json"
 
 
+# Single-flight refresh (P2 #4): every cold cache miss used to run its own
+# _build_payload() AND write the same fixed .tmp path — duplicate restic
+# subprocess bursts and a write race on one temp file. One build at a time;
+# waiters then serve the winner's freshly-published entry.
+_build_lock = threading.Lock()
+
+
 def _build_payload(deadline: Optional[float] = None) -> dict:
     settings = _plugin_settings()
     secrets = {name: _secret(name) for name in SECRET_ENV_NAMES}
@@ -485,6 +497,49 @@ def _build_payload(deadline: Optional[float] = None) -> dict:
     return _scrub_payload(payload, [v for v in secrets.values() if v])
 
 
+def _read_cache(cache: Path, now: float) -> Optional[dict]:
+    """The cached payload when it is inside the TTL, else None (any read or
+    parse problem — including a torn file — degrades to a rebuild)."""
+    try:
+        cached = json.loads(cache.read_text("utf-8"))
+        if now - float(cached.get("ts", 0)) < CACHE_TTL_SECONDS:
+            data = cached.get("data")
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _publish_cache(cache: Path, payload: dict) -> None:
+    """Atomically cache the finished payload. Two correctness rules:
+
+    - the entry is stamped with the COMPLETION time (P2 #3) — a slow
+      _build_payload used to be recorded with its start time and born
+      already expired, so every later poll rebuilt during outages;
+    - each write uses its OWN temp file (P2 #4) — a shared fixed .tmp path
+      raced between writers and could replace the cache with torn content.
+    """
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        record = {"ts": time.time(), "data": payload}
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(cache.parent), prefix=cache.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(record))
+            os.replace(tmp_name, cache)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
 @router.get("/status")
 def status():
     """``GET /api/plugins/hermes-backup/status`` — the widget's one data call.
@@ -495,28 +550,20 @@ def status():
     worker threadpool instead of stalling every other dashboard request.
     """
     cache = _cache_path()
-    now = time.time()
-    try:
-        cached = json.loads(cache.read_text("utf-8"))
-        if now - float(cached.get("ts", 0)) < CACHE_TTL_SECONDS:
-            data = cached.get("data")
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    # Cold build inside a strict overall budget (P1 #2): the desktop client
-    # stops waiting at 30 s, so the whole build — both legs' probes
-    # included — is bounded here. A slow leg answers "stalled" (partial
-    # status); it never holds the response past the client deadline.
-    deadline = time.monotonic() + COLD_BUDGET_SECONDS
-    payload = _build_payload(deadline)
-    try:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write: chip + pane poll concurrently; a torn write would
-        # poison the 60s cache path with corrupt JSON.
-        tmp = cache.with_name(cache.name + ".tmp")
-        tmp.write_text(json.dumps({"ts": now, "data": payload}), "utf-8")
-        os.replace(tmp, cache)
-    except Exception:
-        pass
+    fresh = _read_cache(cache, time.time())
+    if fresh is not None:
+        return fresh
+    with _build_lock:
+        # Another caller may have finished the refresh while we waited on
+        # the lock — serve its fresh entry instead of rebuilding (P2 #4).
+        fresh = _read_cache(cache, time.time())
+        if fresh is not None:
+            return fresh
+        # Cold build inside a strict overall budget (P1 #2): the desktop
+        # client stops waiting at 30 s, so the whole build — both legs'
+        # probes included — is bounded here. A slow leg answers "stalled"
+        # (partial status); it never holds the response past the deadline.
+        deadline = time.monotonic() + COLD_BUDGET_SECONDS
+        payload = _build_payload(deadline)
+        _publish_cache(cache, payload)
     return payload
