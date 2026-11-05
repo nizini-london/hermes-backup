@@ -35,6 +35,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -606,8 +607,8 @@ def stage_shadow_dbs(source: Optional[Path]) -> dict:
         name = "__".join(db_path.relative_to(source).parts)
         dst = shadow / name
         try:
-            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as src, \
-                    sqlite3.connect(str(dst)) as dst_conn:
+            with closing(sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)) as src, \
+                    closing(sqlite3.connect(str(dst))) as dst_conn:
                 src.backup(dst_conn)
             report["copied"].append(name)
         except Exception:
@@ -679,13 +680,37 @@ def _leg_backup(leg: Leg, cfg: Config, extra_excludes: Optional[list[str]] = Non
 
 
 def _parse_backup_json(stdout: str) -> tuple[Optional[str], Optional[int]]:
+    """Parse ``restic backup --json`` output — an NDJSON stream of progress
+    objects ending in one ``summary`` object carrying ``snapshot_id``."""
+    objs: list[dict] = []
     try:
         data = json.loads(stdout or "{}")
-        snapshot_id = (data.get("snapshot_id") or "").strip() or None
-        total = data.get("total_bytes_processed")
-        return snapshot_id, (int(total) if total is not None else None)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None, None
+        if isinstance(data, dict):
+            objs.append(data)
+    except json.JSONDecodeError:
+        pass
+    if not objs:
+        for line in (stdout or "").splitlines():
+            line = line.strip()
+            if not (line.startswith("{") and line.endswith("}")):
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                objs.append(obj)
+    snapshot_id = None
+    total = None
+    for obj in objs:
+        if obj.get("snapshot_id"):
+            snapshot_id = str(obj["snapshot_id"]).strip() or snapshot_id
+        if "total_bytes_processed" in obj:
+            try:
+                total = int(obj["total_bytes_processed"])
+            except (TypeError, ValueError):
+                pass
+    return snapshot_id, total
 
 
 def _restic_error_text(result: ResticResult, limit: int = 400) -> str:
