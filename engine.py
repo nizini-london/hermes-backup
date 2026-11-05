@@ -1019,7 +1019,7 @@ def restore_commit(cfg: Optional[Config] = None, target_dir: str = "",
     copy); refuses paths outside the source tree; verifies every copied file.
     """
     cfg = cfg or load_config()
-    if not confirm:
+    if confirm is not True:  # literal-true only — defense in depth for the handler gate
         return {"ok": False,
                 "error": "refusing to overwrite live files without confirm=true — "
                          "review the restore output first"}

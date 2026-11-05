@@ -108,6 +108,24 @@ def test_commit_refuses_without_confirm(data_root, tmp_path, source_tree):
     assert "confirm" in parsed["error"]
 
 
+def test_commit_confirm_must_be_literal_true(data_root, tmp_path, source_tree):
+    """Fix-round-1 P1: ``confirm`` accepts ONLY the literal boolean true.
+
+    ``bool(args.get("confirm"))`` turned any nonempty string ("false", "no")
+    into approval and then handed the engine a literal True, so the engine's
+    own gate could never catch it. Truthy-but-not-true values are refused."""
+    cfg = make_cfg(tmp_path, source_tree)
+    target = engine.plugin_data_dir() / "gate-probe"  # must never be touched
+    for bad in ("true", "false", "yes", 1):
+        out = tools.handle("backup_restore_commit",
+                           {"target_dir": str(target), "confirm": bad}, cfg=cfg)
+        parsed = json.loads(out)
+        assert parsed["ok"] is False, (bad, out)
+        # the TOOL gate must be the one refusing (never the engine's dir check)
+        assert "refusing to overwrite live files" in parsed["error"], (bad, out)
+        assert not target.exists(), (bad, out)
+
+
 def test_commit_refuses_target_outside_plugin_data(data_root, tmp_path, source_tree):
     cfg = make_cfg(tmp_path, source_tree)
     scratch = tmp_path / "somewhere-else"

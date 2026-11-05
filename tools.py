@@ -141,7 +141,10 @@ def _do_restore(args, cfg=None) -> str:
 # ── backup_restore_commit ────────────────────────────────────────────────────
 def _do_commit(args, cfg=None) -> str:
     target_dir = str(args.get("target_dir") or "").strip()
-    confirm = bool(args.get("confirm"))
+    # STRICT approval: only the literal boolean true counts ("fix round 1":
+    # bool() accepted any nonempty string — "false" — as approval and then
+    # handed the engine a literal True, defeating its own gate).
+    confirm = args.get("confirm") is True
     if not target_dir:
         return tool_error("backup_restore_commit",
                           "target_dir (the scratch dir returned by backup_restore) is required")
@@ -197,7 +200,9 @@ def _do_setup(args, cfg=None) -> str:
                            "user approves) to write and enable the systemd user timer; on "
                            "macOS save the launchd plist into LaunchAgents yourself. The "
                            "cron one-liner is the cross-platform alternative.")
-    if args.get("install"):
+    # STRICT approval (mirror of the confirm fix): the systemd install gate
+    # takes only the literal boolean true — "install": "true" does not install.
+    if args.get("install") is True:
         out["installed"] = engine.install_unit(cfg, interval)
     return _result("backup_setup", **out)
 
