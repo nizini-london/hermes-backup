@@ -36,11 +36,32 @@ def test_registers_exactly_the_manifest_tools(data_root):
         assert callable(entry["handler"])
 
 
-def test_skill_loop_tolerates_missing_dir(data_root):
+def test_skill_loop_tolerates_missing_dir(data_root, tmp_path, monkeypatch):
+    """QA B1 (integration gate): the integrated tree SHIPS skills/ (restore +
+    drill, docs PR #2) — this test used to pass only in the engine-only
+    worktree and went red in the integrated suite. The missing-dir case is
+    now simulated by pointing the plugin at a tmp dir (the pattern of the
+    adjacent tests): the tree layout must not decide the outcome."""
+    monkeypatch.setattr(plugin, "__file__", str(tmp_path / "__init__.py"))
     ctx = FakeCtx()
-    plugin.register(ctx)  # no skills/ dir in the worktree yet
+    plugin.register(ctx)
     assert ctx.skills == []          # loop tolerated the missing dir
     assert len(ctx.tools) == 8       # tools still registered
+
+
+def test_register_matches_shipped_skills(data_root):
+    """QA B1 companion coverage: register() registers EXACTLY the skills that
+    ship under skills/ in whatever tree the plugin lives in — engine-only
+    tree: none; integrated tree: restore + drill. A shipped skill that the
+    loop misses (or a phantom registration) fails here in EITHER tree."""
+    from pathlib import Path
+    skills_dir = Path(plugin.__file__).resolve().parent / "skills"
+    shipped = sorted(d.name for d in skills_dir.iterdir()
+                     if d.is_dir() and (d / "SKILL.md").is_file()) \
+        if skills_dir.is_dir() else []
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    assert sorted(s["name"] for s in ctx.skills) == shipped
 
 
 def test_skill_loop_registers_present_skills(data_root, tmp_path, monkeypatch):
