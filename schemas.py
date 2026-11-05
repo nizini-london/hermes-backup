@@ -106,13 +106,15 @@ BACKUP_VERIFY_SCHEMA = _schema(
 BACKUP_RESTORE_SCHEMA = _schema(
     "backup_restore",
     "THE recovery tool. Restore a file or subtree from a snapshot into a "
-    "scratch directory — NEVER over the live tree — and prove it came back: "
-    "for every restored file returns the byte size, its sha256, the live "
-    "counterpart's sha256, and a matches_live verdict per file. 'path' must "
-    "be an absolute path inside the backup source tree (paths outside are "
-    "refused). 'snapshot_id' defaults to the newest snapshot on the chosen "
-    "leg. Returns scratch_dir — review the files there, then use "
-    "backup_restore_commit (with confirm=true) to move them into place.",
+    "scratch directory — NEVER over the live tree. Hard guarantees: restic "
+    "verifies every restored byte against the snapshot (--verify), paths "
+    "outside the source tree are refused, and the live tree is never "
+    "touched. The per-file matches_live field is INFORMATIONAL, never a "
+    "gate: a deleted file has no live counterpart (null), and a damaged "
+    "file is SUPPOSED to differ — the restore is the repair. 'snapshot_id' "
+    "defaults to the newest snapshot on the chosen leg. Returns scratch_dir "
+    "— review the files there, then use backup_restore_commit (with "
+    "confirm=true) to move them into place.",
     {"path": {
         "type": "string",
         "description": "Absolute path inside the backup source tree to restore.",
@@ -130,12 +132,14 @@ BACKUP_RESTORE_SCHEMA = _schema(
 
 BACKUP_RESTORE_COMMIT_SCHEMA = _schema(
     "backup_restore_commit",
-    "Move a verified scratch restore into place. SAFETY-GATED: requires "
-    "explicit confirm=true; refuses any target_dir outside the plugin data "
-    "dir; and before overwriting a live file takes a one-shot safety copy of "
-    "it under the plugin data dir (pre-commit snapshot) so a bad commit is "
-    "itself reversible. Verifies every copied file's sha256. Only call this "
-    "after the user has seen backup_restore's output and agreed.",
+    "Move a reviewed scratch restore into place. SAFETY-GATED: requires "
+    "explicit confirm=true AND that the user has seen backup_restore's "
+    "scratch output (that review is the gate — matches_live is never one: "
+    "restoring a deleted or damaged file is legitimate and should not be "
+    "blocked by it). Refuses any target_dir outside the plugin data dir; "
+    "before overwriting a live file takes a one-shot safety copy of it "
+    "under the plugin data dir (pre-commit snapshot) so a bad commit is "
+    "itself reversible. Verifies every copied file's sha256.",
     {"target_dir": {
         "type": "string",
         "description": "The scratch directory a previous backup_restore returned.",
@@ -151,11 +155,16 @@ BACKUP_DRILL_SCHEMA = _schema(
     "Disaster-recovery drill: PROVE the backups are restorable instead of "
     "assuming it. Sequentially: (1) report last-snapshot age on both legs, "
     "(2) structural check both legs, (3) 'restic dump' one small real file "
-    "from EACH leg into scratch and byte-compare it against the live copy, "
-    "(4) PASS/FAIL per step, (5) append a dated 'DRILL' verdict line to the "
-    "backup log. deep=true additionally runs a FULL --read-data check of the "
-    "local leg — reads every byte, can take many minutes; never make it the "
-    "default. Refuses each step while a restic cycle is running.",
+    "from EACH leg into scratch and byte-compare — across legs AND against "
+    "the live copy. Steps report PASS / FAIL / SKIP, plus file_pick_mismatch "
+    "— a distinct NON-failure outcome: the dumps came back fine but no "
+    "candidate could be verified against live (the file changed after the "
+    "last snapshot); that is never evidence of a broken backup, the tool "
+    "re-picks another small file automatically. The drill appends a dated "
+    "'DRILL <date> <verdict> driver=<who>' line to the backup log. "
+    "deep=true additionally runs a FULL --read-data check of the local leg "
+    "— reads every byte, can take many minutes; never make it the default. "
+    "Refuses each step while a restic cycle is running.",
     {"deep": {
         "type": "boolean",
         "description": "Add a full --read-data integrity check of the local leg (slow — many minutes). Default false.",
