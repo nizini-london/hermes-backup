@@ -1657,7 +1657,11 @@ def systemd_unit_text(interval_minutes: int) -> dict:
         "Description=Hermes backup cycle (restic, dual-target)\n\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"EnvironmentFile=%h/.config/{PLUGIN_ID}.env\n"
+        # QA S2 (fix round 2): '-' prefix = OPTIONAL env file. A mandatory
+        # EnvironmentFile made every zero-touch install fail at unit load
+        # until the user hand-created the file; absence is now tolerated
+        # (the cycle then runs unconfigured and reports FAIL loudly instead).
+        f"EnvironmentFile=-%h/.config/{PLUGIN_ID}.env\n"
         f"ExecStart={python} {plugin_dir / 'cycle.py'}\n"
     )
     timer = (
@@ -1833,7 +1837,20 @@ def install_unit(cfg: Optional[Config] = None, interval_minutes: Optional[int] =
                 return {"ok": False, "error": f"{cmd[-1]} failed: {proc.stderr.strip()[:300]}"}
     except OSError as exc:
         return {"ok": False, "error": f"unit install failed: {exc}"}
+    # QA S2 (fix round 2): report the env-file absence loudly at install
+    # time. The unit tolerates it ('-EnvironmentFile='), so the install is
+    # zero-touch and never bricks — but until the HERMES_BACKUP_* keys are
+    # written, every cycle runs unconfigured and reports FAIL via
+    # last_run/backup_status (the per-cycle failure still surfaces).
+    env_path = Path(os.path.expanduser(units["env_file_path"]))
+    if env_path.is_file():
+        note = (f"maintain {units['env_file_path']} with the HERMES_BACKUP_* keys listed "
+                "in the env_file template")
+    else:
+        note = (f"{units['env_file_path']} does not exist yet — the timer is enabled "
+                "(the env file is optional now) and every cycle will report FAIL until "
+                "the HERMES_BACKUP_* keys from the env_file template are written there")
     return {"ok": True, "installed": [str(unit_dir / SERVICE_UNIT), str(unit_dir / TIMER_UNIT)],
             "env_file": units["env_file_path"],
-            "note": f"maintain {units['env_file_path']} with the HERMES_BACKUP_* keys listed "
-                    "in the env_file template"}
+            "env_file_missing": not env_path.is_file(),
+            "note": note}

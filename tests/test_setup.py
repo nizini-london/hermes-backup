@@ -1,7 +1,9 @@
 """Setup/scheduler contracts: strict install gate (fix round 1), launchd plist
-environment (fix round 1), referenced password file honoring."""
+environment (fix round 1), referenced password file honoring, optional
+systemd EnvironmentFile (QA S2)."""
 
 import json
+import os
 
 import engine
 import tools
@@ -98,3 +100,57 @@ def test_secrets_load_honors_referenced_password_file(data_root, tmp_path,
     assert engine.Secrets.load().restic_password == TEST_PASSWORD
     monkeypatch.setenv("HERMES_BACKUP_RESTIC_PASSWORD", "env-wins-password-123")
     assert engine.Secrets.load().restic_password == "env-wins-password-123"
+
+
+# ── QA S2: the systemd unit must not brick on a missing EnvironmentFile ──────
+def _fake_systemctl(monkeypatch, fake_home):
+    """A no-op systemctl on PATH, so install_unit exercises its real flow
+    without touching the host's user units."""
+    bin_dir = fake_home / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n")
+    systemctl.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_install_unit_tolerates_missing_env_file(data_root, tmp_path, monkeypatch):
+    """QA S2: the unit used a MANDATORY EnvironmentFile and enabled --now —
+    every zero-touch install failed at unit load until the user hand-created
+    the file. The unit now uses the optional '-EnvironmentFile=' form and the
+    install reports the absence loudly instead of bricking."""
+    fake_home = tmp_path / "fakehome"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))  # Path.home() AND expanduser
+    _fake_systemctl(monkeypatch, fake_home)
+    cfg = make_cfg(tmp_path, source=tmp_path / "home", local_repo=tmp_path / "repo")
+    out = engine.install_unit(cfg, 5)
+    assert out["ok"] is True, out
+    service = (fake_home / ".config/systemd/user/hermes-backup.service").read_text()
+    assert "EnvironmentFile=-%h/.config/hermes-backup.env" in service, service
+    assert out["env_file_missing"] is True
+    assert "does not exist yet" in out["note"], out
+    assert "FAIL" in out["note"], out  # the per-cycle failure is named, not hidden
+
+
+def test_install_unit_env_file_present_note(data_root, tmp_path, monkeypatch):
+    """QA S2 mirror: with the env file present, install reports the normal
+    maintain-it note and env_file_missing=False."""
+    fake_home = tmp_path / "fakehome"
+    (fake_home / ".config").mkdir(parents=True)
+    (fake_home / ".config" / "hermes-backup.env").write_text(
+        "HERMES_BACKUP_SOURCE=/x\n")
+    monkeypatch.setenv("HOME", str(fake_home))  # Path.home() AND expanduser
+    _fake_systemctl(monkeypatch, fake_home)
+    cfg = make_cfg(tmp_path, source=tmp_path / "home", local_repo=tmp_path / "repo")
+    out = engine.install_unit(cfg, 5)
+    assert out["ok"] is True, out
+    assert out["env_file_missing"] is False
+    assert "maintain" in out["note"], out
+
+
+def test_systemd_unit_text_optional_env_file(data_root):
+    """QA S2: the PROPOSED unit text (what the user reviews before install)
+    also carries the optional prefix — the template cannot brick either."""
+    units = engine.systemd_unit_text(5)
+    assert "EnvironmentFile=-%h/.config/hermes-backup.env" in units["service"]

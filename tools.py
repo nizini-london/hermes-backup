@@ -199,7 +199,11 @@ def _do_setup(args, cfg=None) -> str:
     out["install_note"] = ("Files above are proposals only. Pass install=true (after the "
                            "user approves) to write and enable the systemd user timer; on "
                            "macOS save the launchd plist into LaunchAgents yourself. The "
-                           "cron one-liner is the cross-platform alternative.")
+                           "cron one-liner is the cross-platform alternative. The systemd "
+                           "unit's EnvironmentFile (~/.config/hermes-backup.env) is "
+                           "OPTIONAL: the install is zero-touch, and a missing file just "
+                           "means cycles run unconfigured and report FAIL via "
+                           "backup_status until the env_file template keys are written.")
     # STRICT approval (mirror of the confirm fix): the systemd install gate
     # takes only the literal boolean true — "install": "true" does not install.
     if args.get("install") is True:
