@@ -1,0 +1,98 @@
+name: hermes-backup
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: >
+  Encrypted restic backup and verified restore for the Hermes home. Dual-target
+  (local disk + any S3-compatible bucket such as Cloudflare R2), 5-minute-class
+  RPO, hot-database shadow copies, snapshot health status, and a DR drill tool
+  that proves restores actually come back.
+author: Shaun Xenon
+license: MIT
+homepage: https://github.com/shaun-xenon/hermes-backup
+tags: [backup, restore, restic, disaster-recovery, safety, encryption]
+
+provides_tools:
+  - backup_status
+  - backup_now
+  - backup_list
+  - backup_verify
+  - backup_restore
+  - backup_restore_commit
+  - backup_drill
+  - backup_setup
+
+# No hard requires_env: the plugin loads unconfigured and every tool answers
+# with setup guidance until targets/secrets exist. Secrets arrive through
+# config_schema secret fields (rule 11) - never read from env files directly.
+config_schema:
+  source_path:
+    type: str
+    default: ""
+    label: "Backup source path"
+    description: "Absolute path to back up. Empty = the active profile's HERMES_HOME."
+  local_repo:
+    type: str
+    default: ""
+    label: "Local restic repository"
+    description: "Absolute path to a restic repo on a local/mounted drive. Empty disables the local leg."
+  r2_endpoint:
+    type: str
+    default: ""
+    label: "S3 endpoint URL"
+    description: "S3-compatible endpoint (e.g. https://<account>.r2.cloudflarestorage.com). Empty disables the offsite leg."
+  r2_bucket:
+    type: str
+    default: ""
+    label: "S3 bucket name"
+    description: "Bucket for the offsite restic repository."
+  r2_access_key:
+    type: secret
+    env: HERMES_BACKUP_R2_ACCESS_KEY
+    label: "S3 access key"
+    description: "Access key ID for the offsite bucket."
+  r2_secret_key:
+    type: secret
+    env: HERMES_BACKUP_R2_SECRET_KEY
+    label: "S3 secret key"
+    description: "Secret key for the offsite bucket."
+  restic_password:
+    type: secret
+    env: HERMES_BACKUP_RESTIC_PASSWORD
+    label: "Repository password"
+    description: "Restic repo password (client-side encryption). One password = one repo set; losing it loses the backups."
+  interval_minutes:
+    type: int
+    default: 5
+    label: "Snapshot interval (minutes)"
+    description: "Cadence for scheduled snapshots driven by the installed timer or a Hermes cron job."
+  local_keep_within_hours:
+    type: int
+    default: 48
+    label: "Local retention window (hours)"
+  local_keep_last:
+    type: int
+    default: 12
+    label: "Local snapshots to always keep"
+  r2_keep_within_hours:
+    type: int
+    default: 72
+    label: "Offsite retention window (hours)"
+  r2_keep_last:
+    type: int
+    default: 48
+    label: "Offsite snapshots to always keep"
+  excludes:
+    type: list
+    default:
+      - "*/cache/*"
+      - "*/image_cache/*"
+      - "*/audio_cache/*"
+      - "*/document_cache/*"
+      - "*/browser_screenshots/*"
+      - "*/snapshots/*"
+      - "*/checkpoints/*"
+      - ".hermes/hermes-agent/*"
+      - ".cache/*"
+    label: "Path exclusion globs"
+    description: "Restic --exclude patterns applied to every snapshot."
