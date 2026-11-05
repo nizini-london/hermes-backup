@@ -67,13 +67,14 @@ export function jsxs(type, config, maybeKey) {
 
 def _sdk_stub() -> str:
     return """\
-// Stub of the @hermes/plugin-sdk surface used by desktop/plugin.js —
-// element TYPES only (the walker stringifies function names), the
-// composer/notify host, and a useQuery serving the injected status.
+// Stub of the @hermes/plugin-sdk surface used by desktop/plugin.js.
+// Badge/Button/Tip are pass-throughs so a REAL react-dom/server render
+// (tests/test_render.mjs) still emits the widget's own text; the walker
+// test treats them as opaque element types either way.
 export function StatusDot() { return null }
-export function Badge() { return null }
-export function Button() { return null }
-export function Tip() { return null }
+export function Badge({ children }) { return children ?? null }
+export function Button({ children }) { return children ?? null }
+export function Tip({ children }) { return children ?? null }
 export const haptic = () => {}
 export const host = {
   composer: { submit: () => true },
