@@ -68,10 +68,10 @@ def test_drill_line_latest_wins_and_invalid_ignored(data_root):
     _write_log([
         "DRILL 2026-10-01 FAIL driver=shaun",
         "DRILL not-a-date",
-        "DRILL 2026-11-05 PASS driver=venus",
+        "DRILL 2026-11-05 PASS driver=operator",
     ])
     drill = engine.last_drill_verdict()
-    assert drill["date"] == "2026-11-05" and drill["driver"] == "venus"
+    assert drill["date"] == "2026-11-05" and drill["driver"] == "operator"
     assert drill["verdict"] == "PASS"
 
 

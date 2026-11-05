@@ -1,6 +1,6 @@
 """hermes-backup engine — restic wrapper and backup/restore/drill primitives.
 
-Ports the production venus-stack-backup discipline (see BRIEF.md engine port
+Ports a proven production backup-stack discipline (see BRIEF.md engine port
 table) to a plugin engine:
 
 - every restic invocation is an argv list through ``subprocess.run`` (never

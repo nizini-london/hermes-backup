@@ -12,8 +12,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from schemas import TOOLSET, TOOL_NAMES
-import tools
+try:  # package context (Hermes plugin loader, `plugins doctor`)
+    from .schemas import TOOLSET, TOOL_NAMES
+    from . import tools
+except ImportError:  # flat context (tests, direct module use)
+    from schemas import TOOLSET, TOOL_NAMES
+    import tools
 
 logger = logging.getLogger("hermes-backup")
 
@@ -53,7 +57,10 @@ def _skill_description(path: Path) -> str:
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin loader."""
-    from schemas import TOOL_SCHEMAS
+    try:
+        from .schemas import TOOL_SCHEMAS
+    except ImportError:
+        from schemas import TOOL_SCHEMAS
 
     registered = []
     for schema in TOOL_SCHEMAS:

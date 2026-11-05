@@ -15,8 +15,12 @@ import json
 import logging
 from typing import Any
 
-import engine
-from schemas import TOOLSET
+try:  # package context (Hermes plugin loader, `plugins doctor`)
+    from . import engine
+    from .schemas import TOOLSET
+except ImportError:  # flat context (tests, direct module use)
+    import engine
+    from schemas import TOOLSET
 
 logger = logging.getLogger("hermes-backup")
 

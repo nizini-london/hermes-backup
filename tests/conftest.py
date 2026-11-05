@@ -38,10 +38,10 @@ TEST_PASSWORD = "test-restic-password-0123456789"
 
 @pytest.fixture(autouse=True)
 def no_host_restic(monkeypatch):
-    """This host may run its own production restic stack (venus-stack-backup
-    fires every few minutes) — tests must be isolated from it. The pgrep
-    guard is neutralized; tests that verify the guard itself re-arm the REAL
-    check via the ``real_pgrep`` fixture."""
+    """This host may run its own production restic stack on a five-minute
+    timer — tests must be isolated from it. The pgrep guard is neutralized;
+    tests that verify the guard itself re-arm the REAL check via the
+    ``real_pgrep`` fixture."""
     import engine
     original = engine.restic_process_running
     monkeypatch.setattr(engine, "restic_process_running", lambda: False)
