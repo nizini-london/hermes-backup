@@ -1,0 +1,1371 @@
+"""hermes-backup engine — restic wrapper and backup/restore/drill primitives.
+
+Ports the production venus-stack-backup discipline (see BRIEF.md engine port
+table) to a plugin engine:
+
+- every restic invocation is an argv list through ``subprocess.run`` (never
+  ``shell=True``) with a fresh per-call env built from the process env plus
+  secrets fetched through ``agent.secret_scope.get_secret`` (catalog rule 11);
+- ``--no-lock`` on every read-only restic call so programmatic readers never
+  queue behind a running cycle's exclusive lock;
+- per-leg independence: a down local leg never gates the offsite leg;
+- restic exit code 3 (source files vanished mid-read) is tolerated;
+- prune + the 2% data sample are throttled to the first cycle after the top of
+  the hour via ``prune="auto"``;
+- hot SQLite databases are shadow-copied INSIDE the backup source tree
+  (``<source>/.db-shadow/``) before a cycle and cleaned up after it;
+- single-instance cycles via a non-blocking lockfile in the plugin data dir;
+- cycle log under the plugin data dir, verdict lines parseable by
+  ``LOG_VERDICT_RE`` over a 64KB tail (verdict-to-EOF distance grows without
+  bound, so a fixed small tail intermittently misses every verdict).
+
+Secrets are never logged, never returned, and never read from credential
+files. Any text that leaves this module passes through ``scrub()``.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger("hermes-backup")
+
+PLUGIN_ID = "hermes-backup"
+
+# Cycle log + status cache live under the plugin data dir (never under the
+# install dir, which `hermes plugins remove/update` replaces).
+LOG_FILENAME = "backup.log"
+STATUS_CACHE_FILENAME = "status-cache.json"
+CACHE_TTL_SECONDS = 60
+LOG_TAIL_BYTES = 65536          # verdict regex window — see module docstring
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_KEEP_BYTES = 1024 * 1024
+
+# One password protects both legs (one repo set = one password; losing it
+# loses the backups — this is README/FAQ material, not just config text).
+SECRET_ENV_NAMES = {
+    "restic_password": "HERMES_BACKUP_RESTIC_PASSWORD",
+    "r2_access_key": "HERMES_BACKUP_R2_ACCESS_KEY",
+    "r2_secret_key": "HERMES_BACKUP_R2_SECRET_KEY",
+}
+
+# Verdict lines look like "[2026-11-05 10:00:00] OK (local=1 r2=1) …".
+# Requiring the full bracketed date keeps restic progress output such as
+# "[0:04] 100.00%" from ever parsing as a verdict (widget-proven regex).
+LOG_VERDICT_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (\w+)(.*)$")
+LOG_DRILL_RE = re.compile(r"^DRILL (\d{4}-\d{2}-\d{2}) (PASS|FAIL)(?: driver=(\S+))?\s*$")
+
+RESTIC_RC_VANISHED = 3  # source files vanished mid-read — tolerated by design
+
+# Per-command subprocess timeouts (seconds). A legitimate cycle takes
+# minutes; unattended runs must still fail cleanly rather than hang forever.
+TIMEOUTS = {
+    "snapshots": 120,
+    "stats": 180,
+    "init": 120,
+    "check": 600,
+    "check_read_data": 3600,
+    "backup": 1800,
+    "restore": 900,
+    "dump": 300,
+    "forget": 1800,
+}
+
+SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+SHADOW_DIRNAME = ".db-shadow"
+SHADOW_SCAN_DEPTH = 2  # source root + one nested level (state.db, profiles/*/state.db)
+
+RESTIC_BINARY = "restic"
+
+
+def plugin_data_dir() -> Path:
+    """`<hermes home>/plugin-data/hermes-backup/`, created on demand.
+
+    Resolves the active profile's home on every call (profile-safe); imported
+    lazily so the module imports cleanly outside a running Hermes (tests).
+    """
+    from plugins.plugin_storage import plugin_data_dir as _pdd
+
+    return _pdd(PLUGIN_ID)
+
+
+# ── secrets (catalog rule 11) ────────────────────────────────────────────────
+def get_secret(name: str, default: str = "") -> str:
+    """Resolve a credential through Hermes's secret route.
+
+    Runtime: ``agent.secret_scope.get_secret`` — profile-scoped, reads the
+    ``config_schema`` secret fields by their declared env name. Standalone
+    callers (the systemd ``cycle.py``, pytest) run outside Hermes, where the
+    real helper itself falls through to the process env; this fallback keeps
+    the same semantics. It is the ONLY credential read in the plugin and it
+    lives here: no handler, script or test reads credential files or env
+    vars directly.
+    """
+    try:
+        from agent.secret_scope import get_secret as _get
+
+        return _get(name) or ""
+    except ImportError:
+        # Standalone mode (cycle.py under systemd, tests): the env name is
+        # injected by the init system / test fixture, not read from a file.
+        return os.environ.get(name) or default
+
+
+@dataclass
+class Secrets:
+    restic_password: str = ""
+    r2_access_key: str = ""
+    r2_secret_key: str = ""
+
+    @classmethod
+    def load(cls) -> "Secrets":
+        return cls(**{k: get_secret(v) for k, v in SECRET_ENV_NAMES.items()})
+
+
+# ── scrubbing: secret values / names never leave the engine ─────────────────
+_REDACTED = "<redacted>"
+_SECRET_NAME_RE = re.compile(r"(HERMES_BACKUP_[A-Z_]+|RESTIC_PASSWORD|AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY))"
+                             r"(=|\s*[:=]\s*)[^\s\"']+")
+VALUE_SCRUB_MIN_LEN = 6  # shorter values cannot be scrubbed safely by substring
+
+
+def scrub(text: str, secrets: Optional[Secrets] = None) -> str:
+    """Best-effort redaction of credential material from any outgoing text."""
+    if not text:
+        return text
+    out = _SECRET_NAME_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_REDACTED}", str(text))
+    if secrets is not None:
+        for value in (secrets.restic_password, secrets.r2_access_key, secrets.r2_secret_key):
+            if value and len(value) >= VALUE_SCRUB_MIN_LEN:
+                out = out.replace(value, _REDACTED)
+    return out
+
+
+# ── configuration ────────────────────────────────────────────────────────────
+@dataclass
+class Config:
+    source_path: str = ""
+    local_repo: str = ""
+    r2_endpoint: str = ""
+    r2_bucket: str = ""
+    interval_minutes: int = 5
+    local_keep_within_hours: int = 48
+    local_keep_last: int = 12
+    r2_keep_within_hours: int = 72
+    r2_keep_last: int = 48
+    excludes: list[str] = field(default_factory=lambda: [
+        "*/cache/*", "*/image_cache/*", "*/audio_cache/*",
+        "*/browser_screenshots/*", "*/snapshots/*", "*/checkpoints/*",
+        ".hermes/hermes-agent/*", ".cache/*",
+    ])
+
+    @property
+    def source(self) -> Optional[Path]:
+        path = (self.source_path or "").strip()
+        if path:
+            return Path(os.path.expanduser(path)).resolve()
+        # Default: the active profile's Hermes home.
+        try:
+            from hermes_constants import get_hermes_home
+            return Path(get_hermes_home()).resolve()
+        except Exception:
+            home = os.environ.get("HERMES_HOME")  # standalone (systemd) injection
+            return Path(home).resolve() if home else None
+
+    def leg(self, leg_id: str) -> Optional[str]:
+        """Repository URL for a leg, or None when the leg is not configured."""
+        if leg_id == "local":
+            repo = (self.local_repo or "").strip()
+            return os.path.expanduser(repo) if repo else None
+        if leg_id == "r2":
+            endpoint = (self.r2_endpoint or "").strip().rstrip("/")
+            bucket = (self.r2_bucket or "").strip()
+            if endpoint and bucket:
+                return f"s3:{endpoint}/{bucket}"
+        return None
+
+    def retention(self, leg_id: str) -> tuple[int, int]:
+        if leg_id == "local":
+            return self.local_keep_within_hours, self.local_keep_last
+        return self.r2_keep_within_hours, self.r2_keep_last
+
+    def as_dict(self, with_source: bool = True) -> dict:
+        d = {
+            "local_repo": self.local_repo, "r2_endpoint": self.r2_endpoint,
+            "r2_bucket": self.r2_bucket, "interval_minutes": self.interval_minutes,
+            "local_keep_within_hours": self.local_keep_within_hours,
+            "local_keep_last": self.local_keep_last,
+            "r2_keep_within_hours": self.r2_keep_within_hours,
+            "r2_keep_last": self.r2_keep_last, "excludes": list(self.excludes),
+            "legs": {"local": bool(self.leg("local")), "r2": bool(self.leg("r2"))},
+        }
+        if with_source:
+            src = self.source
+            d["source_path"] = str(src) if src else ""
+        return d
+
+
+_SETTING_TYPES = {"int": int, "list": list}
+
+
+def load_config() -> Config:
+    """Resolve plugin settings from the active profile's Hermes config.
+
+    Settings live at ``plugins.entries.<plugin>.settings.<key>`` (validated
+    against the manifest ``config_schema`` at load time). Secret keys are NOT
+    read here — they flow through :func:`get_secret` at call time.
+    """
+    cfg = Config()
+    try:
+        from hermes_cli.config import cfg_get, load_config as load_hermes_config
+        settings = cfg_get(load_hermes_config(), "plugins", "entries", PLUGIN_ID, "settings", default={}) or {}
+    except Exception as exc:  # config unreadable → run on defaults, never raise
+        logger.warning("hermes-backup: settings unreadable, using defaults (%s)", exc)
+        settings = {}
+    for key in ("source_path", "local_repo", "r2_endpoint", "r2_bucket"):
+        value = settings.get(key)
+        if value is not None:
+            setattr(cfg, key, str(value))
+    for key, typ in (("interval_minutes", int), ("local_keep_within_hours", int),
+                     ("local_keep_last", int), ("r2_keep_within_hours", int),
+                     ("r2_keep_last", int)):
+        value = settings.get(key)
+        if value is not None and not isinstance(value, bool):
+            try:
+                setattr(cfg, key, typ(value))
+            except (TypeError, ValueError):
+                pass
+    if isinstance(settings.get("excludes"), list):
+        cfg.excludes = [str(item) for item in settings["excludes"]]
+    return cfg
+
+
+# ── legs + restic runner ─────────────────────────────────────────────────────
+@dataclass
+class ResticResult:
+    rc: int
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.rc == 0
+
+
+@dataclass
+class Leg:
+    leg_id: str            # "local" | "r2"
+    repo: Optional[str]    # None = not configured
+    secrets: Secrets
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.repo)
+
+    def env(self) -> dict:
+        """Fresh env per call: process env + this leg's restic identity."""
+        env = dict(os.environ)
+        env["RESTIC_PASSWORD"] = self.secrets.restic_password
+        env["RESTIC_REPOSITORY"] = self.repo or ""
+        if self.leg_id == "r2":
+            env["AWS_ACCESS_KEY_ID"] = self.secrets.r2_access_key
+            env["AWS_SECRET_ACCESS_KEY"] = self.secrets.r2_secret_key
+        env.pop("RESTIC_PASSWORD_FILE", None)
+        env.pop("RESTIC_PASSWORD_COMMAND", None)
+        return env
+
+    def run(self, argv: list[str], timeout: int, allow_no_lock: bool = False) -> ResticResult:
+        """Run one restic argv list. ``allow_no_lock`` marks read-only calls,
+        which always get ``--no-lock``: a programmatic reader must fail fast,
+        never queue behind a cycle's exclusive lock."""
+        if shutil.which(RESTIC_BINARY) is None:
+            return ResticResult(rc=-1, stderr=_restic_missing_hint())
+        if allow_no_lock and "--no-lock" not in argv:
+            argv = [*argv, "--no-lock"]
+        try:
+            proc = subprocess.run(
+                argv, env=self.env(), capture_output=True, text=True, timeout=timeout)
+            return ResticResult(rc=proc.returncode, stdout=proc.stdout or "", stderr=proc.stderr or "")
+        except subprocess.TimeoutExpired:
+            return ResticResult(rc=-1, stderr=f"restic {argv[1] if len(argv) > 1 else ''!r} timed out after {timeout}s",
+                                timed_out=True)
+        except OSError as exc:
+            return ResticResult(rc=-1, stderr=f"failed to launch restic: {exc}")
+
+
+def _restic_missing_hint() -> str:
+    return ("restic is not installed. Install it first: "
+            "Debian/Ubuntu `sudo apt install restic`, Fedora `sudo dnf install restic`, "
+            "Arch `sudo pacman -S restic`, macOS `brew install restic` (requires restic >= 0.16).")
+
+
+def legs(cfg: Config, secrets: Optional[Secrets] = None) -> list[Leg]:
+    secrets = secrets or Secrets.load()
+    out = []
+    for leg_id in ("local", "r2"):
+        out.append(Leg(leg_id=leg_id, repo=cfg.leg(leg_id), secrets=secrets))
+    return out
+
+
+def get_leg(cfg: Config, leg_id: str, secrets: Optional[Secrets] = None) -> Leg:
+    if leg_id not in ("local", "r2"):
+        raise ValueError(f"unknown leg {leg_id!r} (use 'local' or 'r2')")
+    return legs(cfg, secrets)[("local", "r2").index(leg_id)]
+
+
+def _repo_state(leg: Leg) -> str:
+    """Fast leg health probe used before expensive work."""
+    if not leg.configured:
+        return "not-configured"
+    if leg.leg_id == "local" and not Path(leg.repo).is_dir():
+        return "unmounted"  # local repo path absent — drive likely unmounted
+    if not leg.secrets.restic_password:
+        return "no-password"
+    return "ready"
+
+
+# ── single-instance cycle lock ───────────────────────────────────────────────
+def cycle_lock_path() -> Path:
+    return plugin_data_dir() / "cycle.lock"
+
+
+class CycleBusy(Exception):
+    """A restic cycle (ours) is already active."""
+
+
+def acquire_cycle_lock(timeout: float = 0.0) -> Any:
+    """Non-blocking flock-based single-instance lock (port of the bash flock).
+
+    Raises :class:`CycleBusy` when a previous cycle still holds the lock.
+    Returns the open file object; caller must ``close()`` it to release.
+    """
+    path = cycle_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fd.close()
+        raise CycleBusy("SKIP: previous run active")
+    fd.write(f"{os.getpid()} {int(time.time())}\n")
+    fd.flush()
+    return fd
+
+
+def restic_process_running() -> bool:
+    """True when any restic process is running (``pgrep -x restic``)."""
+    try:
+        proc = subprocess.run(["pgrep", "-x", RESTIC_BINARY],
+                              capture_output=True, text=True, timeout=10)
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False  # pgrep unavailable → cannot assert; do not block on a guess
+
+
+# ── cycle log ────────────────────────────────────────────────────────────────
+def log_path() -> Path:
+    return plugin_data_dir() / LOG_FILENAME
+
+
+def log_append(line: str) -> None:
+    """Append one verdict/detail line, with a size guard (bounded rotation)."""
+    try:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            with open(path, "rb") as f:
+                f.seek(-LOG_KEEP_BYTES, 2)
+                keep = f.read()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_bytes(keep)
+            os.replace(tmp, path)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {line}\n")
+    except OSError as exc:
+        logger.warning("hermes-backup: could not append to log: %s", exc)
+
+
+def log_tail(nbytes: int = LOG_TAIL_BYTES) -> str:
+    """Last ``nbytes`` of the log (verdict-to-EOF distance grows unbounded)."""
+    path = log_path()
+    if not path.exists():
+        return ""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        return f.read().decode("utf-8", "replace")
+
+
+def last_run_verdict() -> Optional[dict]:
+    """Most recent cycle verdict from a 64KB tail (widget-proven parse)."""
+    lines = log_tail().splitlines()[-400:]
+    matches = []
+    for line in lines:
+        m = LOG_VERDICT_RE.match(line.strip())
+        if m:
+            matches.append(m.groups())
+    if not matches:
+        return None
+    stamp, status, detail = matches[-1]
+    epoch = _stamp_epoch(stamp)
+    return {"time": stamp, "epoch": epoch, "verdict": status, "detail": detail.strip()}
+
+
+def last_drill_verdict() -> Optional[dict]:
+    for line in reversed(log_tail().splitlines()[-400:]):
+        m = LOG_DRILL_RE.match(line.strip())
+        if m:
+            date, verdict, driver = m.groups()
+            epoch = _stamp_epoch(f"{date} 00:00:00")
+            return {"date": date, "epoch": epoch, "verdict": verdict, "driver": driver}
+    return None
+
+
+def _stamp_epoch(stamp: str) -> Optional[int]:
+    """Log stamps are local wall-clock; convert to numeric epoch (renderer math)."""
+    try:
+        import calendar
+        parsed = time.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        return calendar.timegm(parsed)
+    except (ValueError, TypeError):
+        return None
+
+
+def append_drill_line(verdict: str, driver: str = "agent") -> None:
+    verdict = verdict if verdict in ("PASS", "FAIL") else "FAIL"
+    driver = (driver or "agent").strip().replace("\n", " ")[:64] or "agent"
+    log_append(f"DRILL {time.strftime('%Y-%m-%d')} {verdict} driver={driver}")
+
+
+# ── snapshot queries (all --no-lock) ────────────────────────────────────────
+def _parse_snapshot_time(iso: str) -> Optional[int]:
+    """Snapshot ``time`` is ISO with (up to 9-digit) fractional seconds —
+    the renderer needs numeric epoch; truncate to microseconds first."""
+    if not iso:
+        return None
+    try:
+        from datetime import datetime
+        iso = re.sub(r"\.(\d+)", lambda m: f".{m.group(1)[:6]}", iso, count=1)
+        return int(datetime.fromisoformat(iso).timestamp())
+    except Exception:
+        return None
+
+
+def _snapshots_json(leg: Leg, latest: int = 0) -> Optional[list]:
+    argv = ["restic", "snapshots"]
+    if latest:
+        argv += ["--latest", str(latest)]
+    argv += ["--json"]
+    for attempt in range(2):  # one retry: lock contention can transiently fail
+        result = leg.run(argv, timeout=TIMEOUTS["snapshots"], allow_no_lock=True)
+        if result.ok:
+            try:
+                data = json.loads(result.stdout or "[]")
+                return data if isinstance(data, list) else None
+            except json.JSONDecodeError:
+                return None
+        time.sleep(2) if attempt == 0 else None
+    return None
+
+
+def latest_snapshot(leg: Leg) -> Optional[dict]:
+    """Newest snapshot as {id, short_id, time, time_epoch, paths, tags}."""
+    snaps = _snapshots_json(leg, latest=1) or []
+    if not snaps:
+        return None
+    snap = snaps[-1]
+    epoch = _parse_snapshot_time(snap.get("time", ""))
+    return {
+        "id": snap.get("id", ""),
+        "short_id": snap.get("short_id", ""),
+        "time": snap.get("time", ""),
+        "time_epoch": epoch,
+        "paths": snap.get("paths", []),
+        "tags": snap.get("tags", []),
+    }
+
+
+def list_snapshots(leg: Leg) -> list[dict]:
+    snaps = _snapshots_json(leg) or []
+    out = []
+    for snap in snaps:
+        summary = snap.get("summary") or {}
+        out.append({
+            "id": snap.get("id", ""),
+            "short_id": snap.get("short_id", ""),
+            "time": snap.get("time", ""),
+            "time_epoch": _parse_snapshot_time(snap.get("time", "")),
+            "paths": snap.get("paths", []),
+            "tags": snap.get("tags", []),
+            "hostname": snap.get("hostname", ""),
+            "total_bytes": summary.get("total_bytes_processed"),
+        })
+    out.sort(key=lambda s: s.get("time_epoch") or 0, reverse=True)
+    return out
+
+
+def repo_stats(leg: Leg) -> Optional[int]:
+    """Repository size in bytes (raw-data mode, numeric epoch consumers)."""
+    result = leg.run(["restic", "stats", "--mode", "raw-data", "--json"],
+                     timeout=TIMEOUTS["stats"], allow_no_lock=True)
+    if not result.ok:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+        return int(data.get("total_size", 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def restic_check(leg: Leg, sample_pct: Optional[float] = None, deep: bool = False) -> ResticResult:
+    """Structural ``restic check``; optional sampled or full data read.
+
+    ``deep`` (full ``--read-data``) can take many minutes — never default.
+    """
+    argv = ["restic", "check"]
+    if deep:
+        argv.append("--read-data")
+    elif sample_pct is not None:
+        argv.append(f"--read-data-subset={sample_pct}%")
+    timeout = TIMEOUTS["check_read_data"] if (deep or sample_pct) else TIMEOUTS["check"]
+    return leg.run(argv, timeout=timeout, allow_no_lock=True)
+
+
+def restic_dump(leg: Leg, snapshot_id: str, path: str) -> ResticResult:
+    """``restic dump`` a single stored (absolute) path to stdout."""
+    return leg.run(["restic", "dump", snapshot_id, path], timeout=TIMEOUTS["dump"],
+                   allow_no_lock=True)
+
+
+# ── hot SQLite shadow copies ─────────────────────────────────────────────────
+def discover_sqlite_dbs(source: Path) -> list[Path]:
+    """Hot databases: *.db/*.sqlite/*.sqlite3 within SCAN_DEPTH of the source
+    root (the Hermes home's hot DBs: ``state.db``, ``profiles/*/state.db``)."""
+    found: list[Path] = []
+    if not source.is_dir():
+        return found
+    source = source.resolve()
+    bases = [(0, source)]
+    try:
+        bases += [(1, source / name) for name in sorted(os.listdir(source))
+                  if (source / name).is_dir()]
+    except OSError:
+        pass
+    for depth, base in bases:
+        if depth > SHADOW_SCAN_DEPTH:
+            break
+        try:
+            for entry in sorted(os.listdir(base)):
+                candidate = base / entry
+                if not candidate.is_file() or candidate.suffix.lower() not in SQLITE_SUFFIXES:
+                    continue
+                if SHADOW_DIRNAME in candidate.parts:
+                    continue
+                found.append(candidate)
+        except OSError:
+            continue
+    # de-dup + stable order
+    seen: set[Path] = set()
+    ordered = [p for p in sorted(set(found)) if not (p in seen or seen.add(p))]
+    return ordered
+
+
+def stage_shadow_dbs(source: Optional[Path]) -> dict:
+    """Shadow-copy hot SQLite DBs INTO the source tree (``<source>/.db-shadow/``).
+
+    ``sqlite3`` backup API (online, WAL-consistent) with a plain copy fallback.
+    Returns a report dict; never raises — a shadow failure must not block a
+    cycle (the DBs are then just snapshotted in their on-disk state).
+    """
+    report: dict = {"shadow_dir": None, "copied": [], "fallback_copied": [], "failed": []}
+    if source is None or not source.is_dir():
+        report["error"] = "source tree missing"
+        return report
+    shadow = source / SHADOW_DIRNAME
+    report["shadow_dir"] = str(shadow)
+    try:
+        shadow.mkdir(exist_ok=True)
+    except OSError as exc:
+        report["error"] = f"cannot create shadow dir: {exc}"
+        return report
+    for db_path in discover_sqlite_dbs(source):
+        name = "__".join(db_path.relative_to(source).parts)
+        dst = shadow / name
+        try:
+            with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as src, \
+                    sqlite3.connect(str(dst)) as dst_conn:
+                src.backup(dst_conn)
+            report["copied"].append(name)
+        except Exception:
+            try:
+                shutil.copy2(db_path, dst)
+                report["fallback_copied"].append(name)
+            except OSError as exc:
+                report["failed"].append({"file": name, "error": str(exc)})
+    return report
+
+
+def cleanup_shadow_dbs(source: Optional[Path]) -> bool:
+    """Remove the staged shadow dir (the post-cycle cleanup trap)."""
+    if source is None:
+        return False
+    shadow = source / SHADOW_DIRNAME
+    if shadow.exists():
+        shutil.rmtree(shadow, ignore_errors=True)
+    return not shadow.exists()
+
+
+# ── snapshot cycle ───────────────────────────────────────────────────────────
+def _top_of_hour_window(cfg: Config, now: Optional[float] = None) -> bool:
+    """True within the first ``interval_minutes`` of the hour — the throttle
+    window the reference stack used for prune + the 2% data check."""
+    minutes = max(1, int(cfg.interval_minutes or 5))
+    now = now if now is not None else time.time()
+    return time.localtime(now).tm_min < minutes
+
+
+def _leg_backup(leg: Leg, cfg: Config, extra_excludes: Optional[list[str]] = None) -> dict:
+    """One leg's snapshot. Never raises; per-leg independence is the contract."""
+    state = _repo_state(leg)
+    if state != "ready":
+        reason = {
+            "not-configured": "leg not configured (run backup_setup)",
+            "unmounted": "local repo path missing (drive unmounted?)",
+            "no-password": "repository password not configured (run backup_setup)",
+        }[state]
+        return {"leg": leg.leg_id, "verdict": "skip", "reason": reason}
+    argv = ["restic", "backup", str(cfg.source or ".")]
+    for pattern in [*(cfg.excludes or []), *(extra_excludes or [])]:
+        argv += ["--exclude", pattern]
+    argv += ["--json"]
+    started = time.time()
+    result = leg.run(argv, timeout=TIMEOUTS["backup"])
+    duration = round(time.time() - started, 1)
+    if result.timed_out:
+        return {"leg": leg.leg_id, "verdict": "fail", "reason": result.stderr,
+                "duration_seconds": duration}
+    snapshot_id = None
+    bytes_processed = None
+    if result.ok or result.rc == RESTIC_RC_VANISHED:
+        snapshot_id, bytes_processed = _parse_backup_json(result.stdout)
+    if result.rc == 0:
+        out = {"leg": leg.leg_id, "verdict": "ok", "snapshot_id": snapshot_id,
+               "duration_seconds": duration}
+    elif result.rc == RESTIC_RC_VANISHED:
+        # tolerated by design on a live agent home; the snapshot still lands
+        out = {"leg": leg.leg_id, "verdict": "ok", "snapshot_id": snapshot_id,
+               "warning": "exit code 3: source files vanished mid-read (tolerated)",
+               "duration_seconds": duration}
+    else:
+        out = {"leg": leg.leg_id, "verdict": "fail",
+               "reason": _restic_error_text(result), "duration_seconds": duration}
+    if bytes_processed is not None:
+        out["bytes_processed"] = bytes_processed
+    return out
+
+
+def _parse_backup_json(stdout: str) -> tuple[Optional[str], Optional[int]]:
+    try:
+        data = json.loads(stdout or "{}")
+        snapshot_id = (data.get("snapshot_id") or "").strip() or None
+        total = data.get("total_bytes_processed")
+        return snapshot_id, (int(total) if total is not None else None)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, None
+
+
+def _restic_error_text(result: ResticResult, limit: int = 400) -> str:
+    text = (result.stderr or result.stdout or "").strip()
+    text = scrub(text.splitlines()[-1] if text else f"restic exit code {result.rc}")
+    return text[:limit]
+
+
+def _leg_forget(leg: Leg, cfg: Config) -> dict:
+    if not leg.configured:
+        return {"leg": leg.leg_id, "pruned": False, "reason": "not configured"}
+    within_hours, keep_last = cfg.retention(leg.leg_id)
+    argv = ["restic", "forget", "--prune",
+            "--keep-within", f"{max(1, int(within_hours))}h",
+            "--keep-last", str(max(1, int(keep_last)))]
+    result = leg.run(argv, timeout=TIMEOUTS["forget"])
+    return {"leg": leg.leg_id, "pruned": result.ok,
+            "reason": None if result.ok else _restic_error_text(result)}
+
+
+def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
+              secrets: Optional[Secrets] = None) -> dict:
+    """One full snapshot cycle: shadow DBs → backup per leg → throttled
+    prune + 2% sample → structural check of the offsite leg, every cycle.
+
+    Single-instance (lockfile + pgrep); busy cycles SKIP cleanly instead of
+    blocking. Per-leg independence: one leg's failure never gates the other.
+    """
+    cfg = cfg or load_config()
+    secrets = secrets or Secrets.load()
+
+    lock = None
+    try:
+        lock = acquire_cycle_lock()
+    except CycleBusy as busy:
+        return {"verdict": "skip", "skipped": True, "reason": str(busy),
+                "legs": {}, "now_epoch": int(time.time())}
+
+    try:
+        if restic_process_running():
+            return {"verdict": "skip", "skipped": True,
+                    "reason": "a restic cycle is already running (pgrep restic)",
+                    "legs": {}, "now_epoch": int(time.time())}
+
+        source = cfg.source
+        shadow_report = stage_shadow_dbs(source)
+        all_legs = legs(cfg, secrets)
+        wanted = [leg for leg in all_legs if leg.configured]
+        results: dict[str, dict] = {}
+
+        try:
+            for leg in wanted:  # sequential; each leg independent by try/except
+                try:
+                    results[leg.leg_id] = _leg_backup(leg, cfg)
+                except Exception as exc:  # a leg crash must never gate the other
+                    logger.exception("hermes-backup: leg %s crashed", leg.leg_id)
+                    results[leg.leg_id] = {"leg": leg.leg_id, "verdict": "fail",
+                                           "reason": scrub(str(exc), secrets)[:400]}
+            for leg in all_legs:
+                results.setdefault(leg.leg_id, {
+                    "leg": leg.leg_id, "verdict": "skip", "reason": "leg not configured"})
+        finally:
+            cleaned = cleanup_shadow_dbs(source)
+            if not cleaned:
+                logger.warning("hermes-backup: shadow dir cleanup incomplete")
+
+        verdict = _cycle_verdict(results, wanted)
+        detail: dict = {"shadow": shadow_report}
+
+        throttled = prune == "force" or (prune == "auto" and _top_of_hour_window(cfg))
+        prune_results = {}
+        sample_result = None
+        structural = {}
+        if wanted and not results.get("skipped"):
+            if throttled:
+                for leg in wanted:
+                    try:
+                        prune_results[leg.leg_id] = _leg_forget(leg, cfg)
+                    except Exception as exc:
+                        prune_results[leg.leg_id] = {"leg": leg.leg_id, "pruned": False,
+                                                     "reason": scrub(str(exc), secrets)[:200]}
+                local_leg = next((leg for leg in wanted if leg.leg_id == "local"), None)
+                if local_leg and _repo_state(local_leg) == "ready":
+                    sample_result = _summarize_check(restic_check(local_leg, sample_pct=2))
+            r2_leg = next((leg for leg in wanted if leg.leg_id == "r2"), None)
+            if r2_leg and _repo_state(r2_leg) == "ready":
+                structural["r2"] = _summarize_check(restic_check(r2_leg))
+        elif throttled:
+            detail["prune_note"] = "no wanted legs; prune skipped"
+
+        detail.update({"prune": prune_results, "sample_check": sample_result,
+                       "structural_check": structural})
+
+        # prune/check problems downgrade a green cycle to WARN, never the
+        # reverse (backups succeeding is the primary contract)
+        if verdict == "ok":
+            if any(not r.get("pruned", True) for r in prune_results.values()):
+                verdict = "warn"
+            if sample_result and not sample_result.get("ok", True):
+                verdict = "warn"
+            if any(not s.get("ok", True) for s in structural.values()):
+                verdict = "warn"
+
+        _log_cycle(results, verdict, wanted, detail)
+        return {"verdict": verdict, "legs": results, "detail": detail,
+                "skipped": False, "now_epoch": int(time.time())}
+    finally:
+        try:
+            if lock is not None:
+                lock.close()
+        except OSError:
+            pass
+
+
+def _summarize_check(result: ResticResult) -> dict:
+    return {"ok": result.ok, "rc": result.rc,
+            "detail": scrub((result.stderr or result.stdout or "").strip().splitlines()[-1]
+                            if (result.stderr or result.stdout).strip()
+                            else f"restic exit {result.rc}")[:200],
+            "timed_out": result.timed_out}
+
+
+def _cycle_verdict(results: dict, wanted: list[Leg]) -> str:
+    """OK when every wanted leg succeeded; WARN when some did; FAIL when none
+    did (reference taxonomy: both legs absent is a failure state)."""
+    wanted_ids = [leg.leg_id for leg in wanted]
+    if not wanted_ids:
+        return "fail"
+    verdicts = [results.get(leg_id, {}).get("verdict") for leg_id in wanted_ids]
+    if all(v == "ok" for v in verdicts):
+        return "ok"
+    if any(v == "ok" for v in verdicts):
+        return "warn"
+    return "fail"
+
+
+def _log_cycle(results: dict, verdict: str, wanted: list[Leg], detail: dict) -> None:
+    for leg_id, res in results.items():
+        if res.get("verdict") in ("warn", "fail"):
+            log_append(f"{res['verdict'].upper()} {leg_id}={res.get('reason') or res.get('warning', '')}")
+    wanted_counts = " ".join(
+        f"{leg.leg_id}={1 if results.get(leg.leg_id, {}).get('verdict') == 'ok' else 0}"
+        for leg in wanted)
+    snapshot_ids = " ".join(
+        f"{leg_id}={res.get('snapshot_id')}" for leg_id, res in results.items()
+        if res.get("snapshot_id"))
+    line = f"{verdict.upper()} ({wanted_counts or 'no-wanted-legs'})"
+    if snapshot_ids:
+        line += f" snapshot={snapshot_ids}"
+    log_append(line)
+
+
+# ── restore + commit ─────────────────────────────────────────────────────────
+def _scratch_dir(base: Optional[Path] = None, prefix: str = "restore") -> Path:
+    root = base or (plugin_data_dir() / "restore-scratch")
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=root))
+
+
+def is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_latest_snapshot(leg: Leg) -> dict:
+    snap = latest_snapshot(leg)
+    if not snap:
+        raise ValueError(f"no snapshots exist yet on the {leg.leg_id} leg "
+                         f"(run backup_now first)")
+    return snap
+
+
+def validate_restore_path(path: str, cfg: Config) -> Path:
+    """Only absolute paths inside the source tree are restorable."""
+    if not path or not path.startswith("/"):
+        raise ValueError("path must be an absolute path inside the backup source tree")
+    source = cfg.source
+    if source is None:
+        raise ValueError("backup source is not configured (run backup_setup)")
+    candidate = Path(path)
+    if not is_within(candidate, source):
+        raise ValueError(f"path {path} is outside the backup source tree "
+                         f"({source}) — refusing to restore")
+    return candidate
+
+
+def restore_path(cfg: Optional[Config] = None, path: str = "", leg_id: str = "local",
+                 snapshot_id: str = "", target_dir: str = "") -> dict:
+    """Restore a path (never over the live tree) into scratch and verify it
+    byte-for-byte against the live counterpart."""
+    cfg = cfg or load_config()
+    source = validate_restore_path(path, cfg)
+    leg = get_leg(cfg, leg_id)
+    if _repo_state(leg) != "ready":
+        return {"ok": False, "error": f"{leg_id} leg is not ready "
+                f"({_repo_state(leg)}) — run backup_setup"}
+    try:
+        snap = _resolve_latest_snapshot(leg) if not snapshot_id else {
+            "short_id": snapshot_id, "id": snapshot_id, "time": "", "time_epoch": None}
+        scratch = Path(target_dir) if target_dir else _scratch_dir()
+        scratch.mkdir(parents=True, exist_ok=True)
+        result = leg.run(["restic", "restore", snap["short_id"], "--include", str(source),
+                          "--target", str(scratch)], timeout=TIMEOUTS["restore"],
+                         allow_no_lock=True)
+        if not result.ok:
+            return {"ok": False, "error": _restic_error_text(result),
+                    "scratch_dir": str(scratch)}
+        # restic recreates the absolute path structure under --target
+        restored_root = scratch.joinpath(*source.parts[1:])
+        files = []
+        for restored in sorted(restored_root.rglob("*")):
+            if not restored.is_file():
+                continue
+            live = Path("/") / restored.relative_to(scratch)
+            entry = {"restored_path": str(restored), "live_path": str(live),
+                     "size_bytes": restored.stat().st_size,
+                     "sha256": _sha256(restored),
+                     "live_sha256": _sha256(live) if live.is_file() else None,
+                     "matches_live": None}
+            if live.is_file():
+                entry["matches_live"] = entry["sha256"] == entry["live_sha256"]
+            files.append(entry)
+        return {"ok": True, "leg": leg_id, "snapshot_id": snap["short_id"],
+                "snapshot_time_epoch": snap.get("time_epoch"),
+                "scratch_dir": str(scratch), "files": files,
+                "all_match": bool(files) and all(f["matches_live"] for f in files)
+                if all(f["matches_live"] is not None for f in files) else None}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        logger.exception("hermes-backup: restore failed")
+        return {"ok": False, "error": scrub(str(exc))[:400]}
+
+
+def _sha256(path: Path) -> Optional[str]:
+    import hashlib
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def restore_commit(cfg: Optional[Config] = None, target_dir: str = "",
+                   confirm: bool = False) -> dict:
+    """Copy verified scratch-restore files into place.
+
+    Discipline encoded: refuses without ``confirm=true``; snapshots any live
+    file about to be replaced into the plugin data dir first (one-shot safety
+    copy); refuses paths outside the source tree; verifies every copied file.
+    """
+    cfg = cfg or load_config()
+    if not confirm:
+        return {"ok": False,
+                "error": "refusing to overwrite live files without confirm=true — "
+                         "review the restore output first"}
+    if not target_dir:
+        return {"ok": False, "error": "target_dir (the scratch restore) is required"}
+    scratch = Path(target_dir)
+    data_root = plugin_data_dir()
+    if not is_within(scratch, data_root):
+        return {"ok": False,
+                "error": f"target_dir must be inside the plugin data dir ({data_root}) — "
+                         "scratch-first is the safety contract"}
+    if not scratch.is_dir():
+        return {"ok": False, "error": f"target_dir {target_dir} does not exist"}
+    source = cfg.source
+    if source is None:
+        return {"ok": False, "error": "backup source is not configured (run backup_setup)"}
+
+    safety_dir = data_root / f"pre-commit-{time.strftime('%Y%m%d-%H%M%S')}"
+    committed, skipped, safety = [], [], []
+    for restored in sorted(scratch.rglob("*")):
+        if not restored.is_file():
+            continue
+        live = Path("/") / restored.relative_to(scratch)
+        if not is_within(live, source):
+            skipped.append({"path": str(live), "reason": "outside source tree"})
+            continue
+        restored_sha = _sha256(restored)
+        if restored.is_file() and live.exists():
+            live_rel = live.relative_to("/")
+            safety_copy = safety_dir / live_rel
+            safety_copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(live, safety_copy)
+            safety.append({"path": str(live), "safety_copy": str(safety_copy),
+                           "sha256": _sha256(safety_copy)})
+        live.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(restored, live)
+        copied_sha = _sha256(live)
+        committed.append({"path": str(live), "sha256": copied_sha,
+                          "verified": copied_sha == restored_sha})
+    ok = bool(committed) and all(c["verified"] for c in committed)
+    return {"ok": ok, "committed": committed, "skipped": skipped,
+            "safety_snapshot": {"dir": str(safety_dir), "files": safety},
+            "error": None if ok else "no files committed or verification failed"}
+
+
+# ── DR drill (the creativity edge, ported verbatim) ─────────────────────────
+def run_drill(cfg: Optional[Config] = None, deep: bool = False,
+              file: str = "", driver: str = "agent", secrets: Optional[Secrets] = None) -> dict:
+    """Prove restorability: snapshot ages both legs → structural checks →
+    ``restic dump`` one small real file from EACH leg into scratch, byte-compare
+    vs live → PASS/FAIL per step → ``DRILL <date> <verdict> driver=<who>`` log line.
+
+    Steps strictly sequential; ``pgrep restic`` before each — never launch a
+    step into an already-locked repo. ``deep`` adds a full ``--read-data``
+    check of the local leg (loud warning: can take many minutes).
+    """
+    cfg = cfg or load_config()
+    secrets = secrets or Secrets.load()
+    steps: list[dict] = []
+
+    def step(name: str, fn) -> dict:
+        if restic_process_running():
+            result = {"step": name, "verdict": "FAIL",
+                      "detail": "a restic cycle is running (pgrep restic) — refusing to launch into a locked repo"}
+        else:
+            try:
+                result = {"step": name, **fn()}
+            except Exception as exc:
+                logger.exception("hermes-backup: drill step %s crashed", name)
+                result = {"step": name, "verdict": "FAIL", "detail": scrub(str(exc), secrets)[:400]}
+        steps.append(result)
+        return result
+
+    all_legs = legs(cfg, secrets)
+    ready = [leg for leg in all_legs if _repo_state(leg) == "ready"]
+
+    # (a) last snapshot age, both legs
+    def _ages() -> dict:
+        ages, ok = {}, True
+        for leg in all_legs:
+            if not leg.configured:
+                ages[leg.leg_id] = "not configured"
+            elif _repo_state(leg) != "ready":
+                ages[leg.leg_id] = f"not ready ({_repo_state(leg)})"
+            else:
+                snap = latest_snapshot(leg)
+                if not snap:
+                    ages[leg.leg_id] = "no snapshots"
+                    ok = False
+                else:
+                    age = int(time.time()) - (snap.get("time_epoch") or 0)
+                    ages[leg.leg_id] = {"snapshot_id": snap["short_id"],
+                                        "age_seconds": age}
+        return {"verdict": "PASS" if ok else "FAIL", "ages": ages}
+
+    step("snapshot_age_both_legs", _ages)
+
+    # (b) structural checks (deep adds full --read-data on the local leg)
+    def _checks() -> dict:
+        out, ok = {}, True
+        for leg in ready:
+            is_deep = deep and leg.leg_id == "local"
+            check = restic_check(leg, deep=is_deep)
+            out[leg.leg_id] = {"ok": check.ok, "deep": is_deep,
+                               "detail": _summarize_check(check)["detail"]}
+            ok = ok and check.ok
+        if not ready:
+            out["error"] = "no leg is ready (nothing to drill)"
+        for leg in all_legs:
+            if leg.configured and _repo_state(leg) != "ready" and leg.leg_id not in out:
+                out[leg.leg_id] = {"ok": False, "state": _repo_state(leg)}
+                ok = False
+        return {"verdict": "PASS" if ok else "FAIL", "checks": out}
+
+    step("structural_checks_both_legs", _checks)
+    deep_warning = ("deep=true runs a FULL read of every byte on the local leg "
+                    "— can take many minutes on large repositories") if deep else None
+
+    # (c) dump one small real file from each leg, byte-compare vs live
+    def _dump_test() -> dict:
+        source = cfg.source
+        target_rel = _drill_file(source, file)
+        if target_rel is None:
+            return {"verdict": "FAIL", "detail": f"no small real file found under {source} to dump-test"}
+        target = source / target_rel
+        results, ok = {}, True
+        for leg in ready:
+            dump = restic_dump(leg, _resolve_latest_snapshot(leg)["short_id"], str(target))
+            live_sha = _sha256(target)
+            if not dump.ok:
+                results[leg.leg_id] = {"ok": False, "detail": _restic_error_text(dump)}
+                ok = False
+                continue
+            dump_sha = _sha256_bytes(dump.stdout.encode("utf-8", "surrogateescape"))
+            match = dump_sha is not None and dump_sha == live_sha
+            results[leg.leg_id] = {"ok": match, "file": str(target), "sha256": dump_sha,
+                                   "live_sha256": live_sha, "matches_live": match}
+            ok = ok and match
+        if not ready:
+            ok = False
+        return {"verdict": "PASS" if ok else "FAIL", "file": str(target),
+                "legs": results}
+
+    step("dump_and_byte_compare", _dump_test)
+
+    passed = all(s.get("verdict") == "PASS" for s in steps)
+    verdict = "PASS" if passed else "FAIL"
+    append_drill_line(verdict, driver)
+    return {"verdict": verdict, "steps": steps, "deep": bool(deep),
+            "deep_warning": deep_warning, "driver": driver, "now_epoch": int(time.time())}
+
+
+def _sha256_bytes(data: bytes) -> Optional[str]:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _drill_file(source: Optional[Path], override: str = "") -> Optional[str]:
+    """Deterministically pick one small real file (1B–256KB, depth ≤ 3) for
+    the dump test — ``config.yaml`` first when present."""
+    if source is None or not source.is_dir():
+        return None
+    if override:
+        candidate = Path(override)
+        if not candidate.is_absolute():
+            candidate = source / override
+        resolved = candidate.resolve()
+        if not (is_within(resolved, source) and resolved.is_file()
+                and 0 < resolved.stat().st_size <= 256 * 1024):
+            return None
+        return str(resolved.relative_to(source))
+    preferred = source / "config.yaml"
+    if preferred.is_file() and 0 < preferred.stat().st_size <= 256 * 1024:
+        return "config.yaml"
+    for path in sorted(source.rglob("*")):
+        if path.is_file() and path.suffix.lower() not in SQLITE_SUFFIXES \
+                and SHADOW_DIRNAME not in path.parts and not path.is_symlink() \
+                and 0 < path.stat().st_size <= 256 * 1024:
+            rel = path.relative_to(source)
+            if len(rel.parts) <= 3:
+                return str(rel)
+    return None
+
+
+# ── timer state (numeric epochs; renderer does the math) ─────────────────────
+TIMER_UNIT = "hermes-backup.timer"
+SERVICE_UNIT = "hermes-backup.service"
+LAUNCHD_LABEL = "com.hermes-backup.cycle"
+
+
+def timer_state() -> dict:
+    """OS scheduler state for the installed timer (Linux systemd user unit,
+    macOS launchd). Best-effort; numeric ``next_epoch`` when schedulable."""
+    state: dict = {"kind": None, "active": False, "next_epoch": None}
+    if shutil.which("systemctl"):
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "show", TIMER_UNIT,
+                 "--property=ActiveState", "--property=NextElapseUSecRealtime"],
+                capture_output=True, text=True, timeout=10)
+            out = proc.stdout or ""
+            active = "ActiveState=active" in out
+            nxt = re.search(r"NextElapseUSecRealtime=(\d+)", out)
+            state.update(kind="systemd", active=active,
+                         next_epoch=(int(nxt.group(1)) / 1e6) if nxt and active else None)
+            return state
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if shutil.which("launchctl"):
+        try:
+            proc = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+                                  capture_output=True, text=True, timeout=10)
+            state.update(kind="launchd", active=proc.returncode == 0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return state
+
+
+# ── status (60s cache; numeric epochs) ───────────────────────────────────────
+def build_status(cfg: Optional[Config] = None, force: bool = False,
+                 secrets: Optional[Secrets] = None) -> dict:
+    """Full status across both legs; cached 60s so pollers never spawn restic
+    subprocesses per tick. All timestamps numeric epoch."""
+    cache_file = plugin_data_dir() / STATUS_CACHE_FILENAME
+    now = time.time()
+    if not force:
+        try:
+            cached = json.loads(cache_file.read_text())
+            if now - cached.get("ts", 0) < CACHE_TTL_SECONDS:
+                data = cached.get("data", {})
+                data["cache_age_seconds"] = round(now - cached.get("ts", 0), 1)
+                return data
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+    cfg = cfg or load_config()
+    secrets = secrets or Secrets.load()
+    source = cfg.source
+    legs_out: dict[str, dict] = {}
+    for leg in legs(cfg, secrets):
+        entry: dict[str, Any] = {"enabled": leg.configured}
+        if not leg.configured:
+            entry["note"] = "not configured — run backup_setup to enable this leg"
+            legs_out[leg.leg_id] = entry
+            continue
+        state = _repo_state(leg)
+        entry["state"] = state
+        snap = latest_snapshot(leg) if state == "ready" else None
+        if snap:
+            entry["last_snapshot"] = {
+                "id": snap["short_id"], "time": snap["time"],
+                "time_epoch": snap["time_epoch"],
+                "age_seconds": int(now - snap["time_epoch"]) if snap["time_epoch"] else None,
+            }
+            interval = max(1, int(cfg.interval_minutes or 5))
+            entry["rpo"] = {
+                "interval_minutes": interval,
+                "behind_schedule": bool(snap["time_epoch"]
+                                        and now - snap["time_epoch"] > 2 * interval * 60),
+            }
+        else:
+            entry["last_snapshot"] = None
+            if state == "ready":
+                entry["note"] = "repo reachable but has no snapshots yet — run backup_now"
+        entry["repo_size_bytes"] = repo_stats(leg) if state == "ready" else None
+        legs_out[leg.leg_id] = entry
+
+    configured = any(l["enabled"] for l in legs_out.values())
+    data = {
+        "configured": configured,
+        "source_path": str(source) if source else "",
+        "legs": legs_out,
+        "last_run": last_run_verdict(),
+        "last_drill": last_drill_verdict(),
+        "timer": timer_state(),
+        "rpo_interval_minutes": max(1, int(cfg.interval_minutes or 5)),
+        "now_epoch": int(now),
+    }
+    if not configured:
+        data["guidance"] = ("Nothing is configured yet: run the backup_setup tool "
+                            "to create the restic repos and print the exact "
+                            "scheduler setup (systemd timer, launchd, or a "
+                            "Hermes cron one-liner).")
+    try:
+        tmp = cache_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"ts": now, "data": data}))
+        os.replace(tmp, cache_file)  # atomic: two pollers can race this file
+    except OSError:
+        pass
+    return data
+
+
+# ── setup helpers (unit files, init) ─────────────────────────────────────────
+def restic_missing() -> Optional[str]:
+    """Install hint when restic is absent (per-OS command), else None."""
+    if shutil.which(RESTIC_BINARY):
+        return None
+    return _restic_missing_hint()
+
+
+def _on_calendar(interval_minutes: int) -> str:
+    minutes = max(1, int(interval_minutes or 5))
+    if 60 % minutes == 0:
+        return f"*:0/{minutes}"
+    return f"*-*-* *:0/{minutes}"  # systemd accepts this form; near-hour drift noted
+
+
+def systemd_unit_text(interval_minutes: int) -> dict:
+    """Exact systemd user unit + timer content for the chosen cadence."""
+    calendar = _on_calendar(interval_minutes)
+    plugin_dir = Path(__file__).resolve().parent
+    python = shutil.which("python3") or "/usr/bin/python3"
+    service = (
+        "[Unit]\n"
+        "Description=Hermes backup cycle (restic, dual-target)\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"EnvironmentFile=%h/.config/{PLUGIN_ID}.env\n"
+        f"ExecStart={python} {plugin_dir / 'cycle.py'}\n"
+    )
+    timer = (
+        "[Unit]\n"
+        "Description=Run the hermes-backup cycle on a schedule\n\n"
+        "[Timer]\n"
+        f"OnCalendar={calendar}\n"
+        "Persistent=true\n"
+        "Unit=hermes-backup.service\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    env_file = (
+        "# hermes-backup scheduler env — maintain these keys yourself:\n"
+        "#   HERMES_BACKUP_RESTIC_PASSWORD (required)\n"
+        "#   HERMES_BACKUP_R2_ACCESS_KEY / HERMES_BACKUP_R2_SECRET_KEY (offsite leg)\n"
+        "#   HERMES_BACKUP_SOURCE / HERMES_BACKUP_LOCAL_REPO / HERMES_BACKUP_R2_ENDPOINT /\n"
+        "#   HERMES_BACKUP_R2_BUCKET / HERMES_BACKUP_INTERVAL_MINUTES (optional overrides)\n"
+        "# The cycle script reads ONLY its process env (injected here); it never\n"
+        "# reads this or any other credential file directly.\n"
+    )
+    return {"service": service, "timer": timer, "env_file": env_file,
+            "env_file_path": f"~/.config/{PLUGIN_ID}.env",
+            "on_calendar": calendar}
+
+
+def launchd_plist_text(interval_minutes: int) -> dict:
+    plugin_dir = Path(__file__).resolve().parent
+    python = shutil.which("python3") or "/usr/bin/python3"
+    plist = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\">\n<dict>\n"
+        f"  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n"
+        "  <key>ProgramArguments</key><array>\n"
+        f"    <string>{python}</string>\n"
+        f"    <string>{plugin_dir / 'cycle.py'}</string>\n"
+        "  </array>\n"
+        f"  <key>StartInterval</key><integer>{max(60, int(interval_minutes) * 60)}</integer>\n"
+        "  <key>RunAtLoad</key><false/>\n"
+        "  <key>StandardOutPath</key><string>/tmp/hermes-backup-cycle.out</string>\n"
+        "  <key>StandardErrorPath</key><string>/tmp/hermes-backup-cycle.err</string>\n"
+        "</dict>\n</plist>\n"
+    )
+    return {"plist": plist, "label": LAUNCHD_LABEL,
+            "path": f"~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"}
+
+
+def cron_one_liner(interval_minutes: int) -> str:
+    minutes = max(1, int(interval_minutes or 5))
+    return (f"hermes cron create '{minutes}m' --name hermes-backup --deliver origin "
+            f"'Use the backup_now tool with prune set to auto and report the per-leg verdict.'")
+
+
+def init_repo(cfg: Optional[Config] = None, leg_id: str = "local",
+              secrets: Optional[Secrets] = None) -> dict:
+    """``restic init`` on demand (idempotent-ish: an already-initialized repo
+    is reported as a warning, not an error)."""
+    cfg = cfg or load_config()
+    secrets = secrets or Secrets.load()
+    leg = get_leg(cfg, leg_id, secrets)
+    state = _repo_state(leg)
+    if state == "not-configured":
+        return {"ok": False, "error": f"{leg_id} leg is not configured "
+                "(set its repository in the plugin settings first)"}
+    if state == "no-password":
+        return {"ok": False, "error": "repository password not configured "
+                "(set the restic_password secret, then retry)"}
+    if leg.leg_id == "local":
+        Path(leg.repo).mkdir(parents=True, exist_ok=True)
+    result = leg.run(["restic", "init"], timeout=TIMEOUTS["init"])
+    text = scrub((result.stderr or result.stdout or "").strip(), secrets)
+    if result.ok:
+        return {"ok": True, "leg": leg_id, "repo": leg.repo, "detail": text[:400]}
+    if "already exists" in text or "already initialized" in text.lower() \
+            or "config file already exists" in text.lower():
+        return {"ok": True, "leg": leg_id, "repo": leg.repo,
+                "detail": "repository already initialized", "already_initialized": True}
+    return {"ok": False, "leg": leg_id, "error": text[:400] or f"restic exit {result.rc}"}
+
+
+def install_unit(cfg: Optional[Config] = None, interval_minutes: Optional[int] = None) -> dict:
+    """Write + enable the systemd user unit and timer. ONLY called with an
+    explicit ``install: true`` (rule 12: the tool asks, the user approves)."""
+    if shutil.which("systemctl") is None:
+        return {"ok": False,
+                "error": "systemctl not found — on macOS use the launchd plist from "
+                         "backup_setup output (LaunchAgents) instead"}
+    interval = interval_minutes or (cfg or load_config()).interval_minutes
+    units = systemd_unit_text(interval)
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    try:
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        (unit_dir / SERVICE_UNIT).write_text(units["service"])
+        (unit_dir / TIMER_UNIT).write_text(units["timer"])
+        for cmd in (["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", "--now", TIMER_UNIT]):
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                return {"ok": False, "error": f"{cmd[-1]} failed: {proc.stderr.strip()[:300]}"}
+    except OSError as exc:
+        return {"ok": False, "error": f"unit install failed: {exc}"}
+    return {"ok": True, "installed": [str(unit_dir / SERVICE_UNIT), str(unit_dir / TIMER_UNIT)],
+            "env_file": units["env_file_path"],
+            "note": f"maintain {units['env_file_path']} with the HERMES_BACKUP_* keys listed "
+                    "in the env_file template"}
