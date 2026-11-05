@@ -80,8 +80,13 @@ LOG_TAIL_BYTES = 65536
 # A verdict must carry a full date: restic progress lines such as
 # "[0:04] 100.00%" also bracket their content and must not parse as verdicts.
 _VERDICT_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (\w+)\b(.*)$")
+# Verdict pinned to the engine's alphabet: engine.py's LOG_DRILL_RE matches
+# only ``DRILL <date> PASS|FAIL`` and that is all backup_drill ever writes —
+# a malformed line must not render as a drill verdict (QA N4b, display-only
+# before). Case tolerance stays for hand-edited logs; ``\b`` keeps a longer
+# word (PASSING) from half-matching PASS.
 _DRILL_RE = re.compile(
-    r"^\s*DRILL\s+(\d{4}-\d{2}-\d{2})\s+(\w+)(?:.*\bdriver=(\S+))?", re.IGNORECASE
+    r"^\s*DRILL\s+(\d{4}-\d{2}-\d{2})\s+(PASS|FAIL)\b(?:.*\bdriver=(\S+))?", re.IGNORECASE
 )
 
 # env names from plugin.yaml's config_schema ``type: secret`` fields.

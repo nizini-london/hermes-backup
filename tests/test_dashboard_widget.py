@@ -385,6 +385,30 @@ def test_last_drill_parsing(tmp_path, monkeypatch):
     assert isinstance(drill["epoch"], int) and drill["epoch"] > 1_000_000_000
 
 
+def test_drill_verdict_pinned_to_engine_alphabet(tmp_path, monkeypatch):
+    """QA N4b regression: _DRILL_RE accepts only the verdicts the engine's
+    LOG_DRILL_RE writes (PASS|FAIL) — a malformed line must not render as a
+    drill verdict (display-only before), and a longer word (PASSING) must
+    not half-match PASS."""
+    mod = _load_plugin_api(tmp_path, monkeypatch)
+    log = mod._log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        "DRILL 2026-11-01 WEIRD driver=agent\n"     # never a verdict the engine writes
+        "DRILL 2026-11-02 PASSING driver=agent\n"   # prefix must not half-match
+        "DRILL 2026-11-03 PASS driver=agent\n",     # the real one still parses
+        "utf-8",
+    )
+    drill = mod._last_drill(log)
+    assert drill["verdict"] == "PASS"
+    assert drill["date"] == "2026-11-03"
+    assert drill["driver"] == "agent"
+
+    bogus = log.parent / "bogus.log"
+    bogus.write_text("DRILL 2026-11-04 WEIRD driver=agent\n", "utf-8")
+    assert mod._last_drill(bogus) is None          # bogus verdict → "no drill recorded"
+
+
 def test_schedule_prefers_active_timer_then_cron(tmp_path, monkeypatch):
     """P2 #6 regression: preference order is active timer > active cron >
     installed-but-inactive timer > none. An INACTIVE timer used to be
