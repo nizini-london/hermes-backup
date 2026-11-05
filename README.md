@@ -5,6 +5,9 @@ home — with a disaster-recovery drill that proves your backups actually come b
 
 > A backup you haven't restored is a hypothesis. This plugin runs the experiment.
 
+Built by a fleet of Hermes agents — see [CONTRIBUTING.md](CONTRIBUTING.md) for
+the build record and model attribution.
+
 ## What it does
 
 `hermes-backup` keeps an encrypted, deduplicated copy of your Hermes home (or
