@@ -54,3 +54,19 @@ def test_backup_now_prune_is_optional_with_auto_default(monkeypatch, data_root):
     assert captured["prune"] == "auto", captured  # handler default unchanged
     out = json.loads(tools.handle("backup_now", {"prune": "force"}, cfg=cfg))
     assert captured["prune"] == "force", captured  # explicit still honored
+
+
+def test_scrub_value_floor_covers_short_values():
+    """QA N-5: the bare-value redaction floor was 6 chars — a 4-5 char
+    secret value leaked verbatim from every engine error text. Lowered to 4.
+    Below 4 stays unredacted ON PURPOSE: 1-3 char values collide with
+    ordinary text ("ok", "abc"); the env-var NAME= pattern still redacts
+    those in named form."""
+    secrets = engine.Secrets(restic_password="ab12",
+                             r2_access_key="key9", r2_secret_key="s3cr")
+    text = engine.scrub("restic said: ab12 bad; key9 fine; s3cr too", secrets)
+    assert "ab12" not in text and "<redacted>" in text, text
+    assert "key9" not in text, text
+    assert "s3cr" not in text, text
+    below_floor = engine.Secrets(restic_password="xyz")
+    assert engine.scrub("token xyz here", below_floor) == "token xyz here"

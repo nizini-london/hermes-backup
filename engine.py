@@ -181,7 +181,10 @@ class Secrets:
 _REDACTED = "<redacted>"
 _SECRET_NAME_RE = re.compile(r"(HERMES_BACKUP_[A-Z_]+|RESTIC_PASSWORD|AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY))"
                              r"(=|\s*[:=]\s*)[^\s\"']+")
-VALUE_SCRUB_MIN_LEN = 6  # shorter values cannot be scrubbed safely by substring
+# QA N-5 (fix round 2): was 6 — 4-5 char secret values leaked verbatim from
+# every error text. 4 is the floor; below it a bare value collides with
+# ordinary text ("ok", "abc"), and those stay covered by the KEY= pattern.
+VALUE_SCRUB_MIN_LEN = 4
 
 
 def scrub(text: str, secrets: Optional[Secrets] = None) -> str:
