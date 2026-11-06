@@ -378,3 +378,95 @@ def test_commit_error_enumerates_already_replaced_files(data_root, tmp_path,
     assert "simulated disk full" in res["error"], res
     assert "Safety copies" in res["error"] and "manual rollback" in res["error"], res
     assert res.get("safety_snapshot", {}).get("dir"), res  # rollback pointer present
+
+
+# ── fix round 3, Greptile P2: rollback state survives EVERY failure point ────
+#
+# The per-file restore op is: safety-copy the live file → ensure the live
+# parent dir → copy the restored file over live. The round-2 N-8 guard only
+# wrapped the OVERWRITE copy; a failure at the safety-copy step or the
+# parent-dir step mid-restore escaped restore_commit entirely and tools'
+# never-raise wrapper answered a bare "unexpected failure" — the caller lost
+# the list of already-replaced files AND the safety copies needed to undo
+# them. Both new tests prove the envelope carries `committed` +
+# `safety_snapshot` for files already processed, no matter which step fails.
+
+def _two_file_scratch(scratch, live_rel):
+    """A minimal scratch restore: two files, both with live counterparts."""
+    for name in ("a.txt", "b.txt"):
+        p = scratch / live_rel / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"restored-{name}\n")
+
+
+def test_commit_error_carries_rollback_state_on_safety_copy_failure(
+        data_root, tmp_path, source_tree, monkeypatch):
+    """Greptile fix-round-3 P2: the SAFETY-COPY step fails mid-restore (after
+    an earlier file was already replaced) — the error envelope must still
+    carry `committed` + `safety_snapshot` so the caller can undo, not a bare
+    'unexpected failure'."""
+    cfg = make_cfg(tmp_path, source_tree)
+    live_rel = str(source_tree).lstrip("/")
+    scratch = engine.plugin_data_dir() / "scratch" / "safety-fail"
+    _two_file_scratch(scratch, live_rel)
+    (source_tree / "a.txt").write_text("live-a\n")
+    (source_tree / "b.txt").write_text("live-b\n")
+
+    real_copy2 = engine.shutil.copy2
+    safety_copies = {"n": 0}
+
+    def flaky(src, dst, *args, **kwargs):
+        if "pre-commit-" in str(dst):
+            safety_copies["n"] += 1
+            if safety_copies["n"] == 2:  # SECOND safety copy fails
+                raise OSError("simulated safety-copy failure")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(engine.shutil, "copy2", flaky)
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    res = json.loads(out)
+    assert res["ok"] is False, out
+    committed = res.get("committed") or []
+    assert [c["path"] for c in committed] == [str(source_tree / "a.txt")], res
+    snap = res.get("safety_snapshot") or {}
+    assert snap.get("dir"), res
+    assert [f["path"] for f in (snap.get("files") or [])] == \
+        [str(source_tree / "a.txt")], res
+    assert "commit interrupted" in res["error"], res
+    assert "simulated safety-copy failure" in res["error"], res
+    # nothing beyond the failure point was touched
+    assert (source_tree / "b.txt").read_text() == "live-b\n"
+
+
+def test_commit_error_carries_rollback_state_on_parent_dir_failure(
+        data_root, tmp_path, source_tree):
+    """Greptile fix-round-3 P2: a PARENT-DIR creation failure mid-restore (a
+    regular FILE blocking the mkdir of a live parent) — same contract: the
+    envelope carries `committed` + `safety_snapshot` for files already
+    replaced. Real filesystem, no mocks."""
+    cfg = make_cfg(tmp_path, source_tree)
+    live_rel = str(source_tree).lstrip("/")
+    scratch = engine.plugin_data_dir() / "scratch" / "parent-blocked"
+    (source_tree / "a.txt").write_text("live-a\n")
+    (source_tree / "blocker").write_text("not a directory\n")  # blocks mkdir
+    (scratch / live_rel / "a.txt").parent.mkdir(parents=True, exist_ok=True)
+    (scratch / live_rel / "a.txt").write_text("restored-a\n")
+    blocked = scratch / live_rel / "blocker" / "b.txt"  # live = <source>/blocker/b.txt
+    blocked.parent.mkdir(parents=True)
+    blocked.write_text("restored-b\n")
+
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    res = json.loads(out)
+    assert res["ok"] is False, out
+    committed = res.get("committed") or []
+    assert [c["path"] for c in committed] == [str(source_tree / "a.txt")], res
+    snap = res.get("safety_snapshot") or {}
+    assert snap.get("dir"), res
+    assert [f["path"] for f in (snap.get("files") or [])] == \
+        [str(source_tree / "a.txt")], res
+    assert "commit interrupted" in res["error"], res
+    # the blocker file survived; the failed file was never written
+    assert (source_tree / "blocker").read_text() == "not a directory\n"
+    assert not (source_tree / "blocker" / "b.txt").exists()
