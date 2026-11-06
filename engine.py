@@ -1252,26 +1252,38 @@ def restore_commit(cfg: Optional[Config] = None, target_dir: str = "",
                               "first, then retry the commit"})
                 continue
         restored_sha = _sha256(restored)
-        if restored.is_file() and live.exists():
-            live_rel = live.relative_to("/")
-            safety_copy = safety_dir / live_rel
-            safety_copy.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(live, safety_copy)
-            safety.append({"path": str(live), "safety_copy": str(safety_copy),
-                           "sha256": _sha256(safety_copy)})
-        live.parent.mkdir(parents=True, exist_ok=True)
         try:
+            # Greptile fix-round-3 P2: the WHOLE per-file op is guarded, not
+            # just the overwrite copy — the safety-copy parent mkdir, the
+            # safety copy itself, and the live parent mkdir can all fail
+            # AFTER earlier files were already replaced, and every such
+            # failure must carry the same rollback state (already-replaced
+            # files, in order + safety copies taken so far) instead of
+            # escaping as a bare "unexpected failure".
+            if restored.is_file() and live.exists():
+                live_rel = live.relative_to("/")
+                safety_copy = safety_dir / live_rel
+                safety_copy.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(live, safety_copy)
+                safety.append({"path": str(live), "safety_copy": str(safety_copy),
+                               "sha256": _sha256(safety_copy)})
+            live.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(restored, live)
         except OSError as exc:
-            # QA N-8 (fix round 2): a mid-loop failure must say exactly which
-            # files were already replaced over live — and that the pre-commit
-            # safety copies exist for manual rollback — not a bare error.
+            # QA N-8 (fix round 2) + Greptile fix-round-3 P2: a mid-loop
+            # failure at ANY per-file step — safety copy, parent mkdir, or
+            # the overwrite copy — must say exactly which files were already
+            # replaced over live and that the pre-commit safety copies exist
+            # for manual rollback, not a bare error. The N-1 scrub contract
+            # applies to the whole envelope: the message is scrubbed; the
+            # structural path fields flow through as data.
             return {"ok": False,
-                    "error": (f"commit interrupted after {len(committed)} file(s): {exc}. "
+                    "error": (f"commit interrupted after {len(committed)} file(s): "
+                              f"{scrub(str(exc))}. "
                               f"Already replaced: "
                               f"{[c['path'] for c in committed] or 'none'}. "
-                              f"Safety copies of every replaced file are under "
-                              f"{safety_dir} for manual rollback."),
+                              f"Safety copies for every file in safety_snapshot "
+                              f"are under {safety_dir} for manual rollback."),
                     "committed": committed, "skipped": skipped,
                     "safety_snapshot": {"dir": str(safety_dir), "files": safety}}
         copied_sha = _sha256(live)
