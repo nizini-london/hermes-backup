@@ -17,7 +17,7 @@ export TEST_HOME=/tmp/hb-e2e-home
 export RESTIC_PASSWORD=hb-e2e-test                 # env-routed; restic -p is a FILE flag
 rm -rf "$TEST_HOME" /tmp/hb-e2e-repo /tmp/hb-e2e-restore
 restic init -r /tmp/hb-e2e-repo                    # scratch local repo
-HERMES_HOME="$TEST_HOME" hermes plugins install /home/shaun/repos/hermes-backup
+HERMES_HOME="$TEST_HOME" hermes plugins install /path/to/hermes-backup
 HERMES_HOME="$TEST_HOME" hermes plugins doctor hermes-backup --ci
 ```
 

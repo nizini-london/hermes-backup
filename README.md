@@ -52,7 +52,10 @@ byte-compares it against the live file, and records a dated PASS/FAIL verdict.
      home.
 3. **Provide secrets** — `restic_password`, plus `r2_access_key` /
    `r2_secret_key` if you use the offsite leg. They are stored through Hermes'
-   secret storage; never in env files, never logged, never echoed back.
+   secret storage; never logged, never echoed back, and the plugin code never
+   reads credential files. One by-design exception: the standalone scheduled
+   cycle runs outside Hermes and gets its credentials from an env file you
+   maintain — the installed unit names that file's path.
 4. **Initialize the repositories** — `backup_setup` runs `restic init` on
    demand.
 5. **Schedule it** — `backup_setup` prints a systemd user unit + timer (Linux)
@@ -150,8 +153,13 @@ This plugin takes the following actions, so you can decide with open eyes:
   `install: true`. On macOS it prints a launchd plist for you to install.
   Nothing is installed silently.
 - **Secrets**: the repository password and S3 keys are stored through Hermes'
-  secret storage (plugin config secrets). They are never written to env files,
-  never logged, and never included in tool output.
+  secret storage (plugin config secrets) — never logged, never included in tool
+  output, and the plugin code never opens a credential file. The one exception
+  is the standalone scheduled cycle: it runs outside Hermes, so systemd (or
+  launchd) injects its credentials from an env file you maintain. The unit
+  declares that file as an optional `EnvironmentFile=`, `backup_setup` warns
+  when it is absent, and a missing file fails the cycle visibly in `status` —
+  never silently.
 
 ## Requirements
 
