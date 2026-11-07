@@ -32,7 +32,7 @@ these tests run offline on any machine with node and CANNOT skip for a
 dependency reason. The only legitimate skip in the render suite is a
 missing node binary (documented there).
 
-Run: /home/shaun/.hermes/hermes-agent/venv/bin/python -m pytest tests/test_render.py -q
+Run: python3 -m pytest tests/test_render.py -q
 """
 
 from __future__ import annotations
