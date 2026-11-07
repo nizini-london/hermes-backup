@@ -1,0 +1,472 @@
+"""Restore safety: scratch-first, path containment, restic-verified bytes,
+informational matches_live (never a gate), confirm-gated commit with
+pre-commit safety copies. Fix round 1 adds: custom target_dir confinement
+to the plugin scratch root, literal-true confirm."""
+
+import json
+
+import engine
+import tools
+from conftest import read_calls, snapshot_fixture, write_state
+
+
+def make_cfg(tmp_path, source, local_repo=None, r2=False):
+    return engine.Config(source_path=str(source),
+                         local_repo=str(local_repo) if local_repo else "",
+                         r2_endpoint="https://acct.r2.cloudflarestorage.com" if r2 else "",
+                         r2_bucket="bucket" if r2 else "")
+
+
+def cycle_ok(cfg):
+    result = engine.run_cycle(cfg, prune="skip",
+                              secrets=engine.Secrets(restic_password=engine.get_secret(
+                                  "HERMES_BACKUP_RESTIC_PASSWORD")))
+    assert result["verdict"] == "ok", result
+
+
+def test_refuses_paths_outside_source(data_root, tmp_path, source_tree):
+    cfg = make_cfg(tmp_path, source_tree)
+    for bad in ("/etc/passwd", str(tmp_path / "outside" / "file"), "~/notes"):
+        out = tools.handle("backup_restore", {"path": bad}, cfg=cfg)
+        parsed = json.loads(out)
+        assert parsed["ok"] is False, (bad, out)
+        assert "outside the backup source tree" in parsed["error"] or \
+               "absolute" in parsed["error"], (bad, out)
+
+
+def test_refuses_relative_and_empty_paths(data_root, tmp_path, source_tree):
+    cfg = make_cfg(tmp_path, source_tree)
+    out = tools.handle("backup_restore", {"path": "config.yaml"}, cfg=cfg)
+    assert json.loads(out)["ok"] is False
+    out = tools.handle("backup_restore", {})
+    assert json.loads(out)["ok"] is False
+
+
+def test_real_restore_to_scratch_with_sha_verify(data_root, tmp_path, plugin_env,
+                                                 source_tree, local_repo):
+    """Real restic repo: snapshot → restore (--verify) → scratch, sha vs live."""
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    cycle_ok(cfg)
+    live_file = source_tree / "config.yaml"
+    out = tools.handle("backup_restore", {"path": str(live_file)}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out
+    assert parsed["restic_verified"] is True
+    assert parsed["files"], "expected the restored file listed"
+    entry = parsed["files"][0]
+    assert entry["live_path"] == str(live_file)
+    assert entry["matches_live"] is True
+    assert entry["sha256"] == entry["live_sha256"]
+    assert parsed["summary"]["matching_live"] == 1
+    scratch = parsed["scratch_dir"]
+    assert scratch.startswith(str(engine.plugin_data_dir()))
+    # the restored bytes equal the live bytes
+    import hashlib
+    from pathlib import Path
+    restored = Path(scratch) / str(live_file).lstrip("/")
+    assert hashlib.sha256(restored.read_bytes()).hexdigest() == entry["sha256"]
+
+
+def test_restore_detects_drifted_live_file(data_root, tmp_path, plugin_env,
+                                           source_tree, local_repo):
+    """Snapshot, then MODIFY the live file: restored copy differs — expected,
+    informational, never a failure."""
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    cycle_ok(cfg)
+    (source_tree / "config.yaml").write_text("drifted content\n")
+    out = tools.handle("backup_restore", {"path": str(source_tree / "config.yaml")}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True
+    assert parsed["files"][0]["matches_live"] is False
+    assert parsed["files"][0]["live_sha256"] != parsed["files"][0]["sha256"]
+    # the steer: a differing live file is EXPECTED (the restore is the repair)
+    assert "the restore is the repair" in parsed["files"][0]["reason"]
+    assert parsed["summary"]["differing_live"] == 1
+
+
+def test_restore_deleted_live_file_is_informational(data_root, tmp_path, plugin_env,
+                                                    source_tree, local_repo):
+    """A file DELETED since the snapshot: restored fine, matches_live null +
+    reason — and confirm is the only gate for committing it back."""
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    cycle_ok(cfg)
+    (source_tree / "notes.md").unlink()  # delete the live file
+    out = tools.handle("backup_restore", {"path": str(source_tree / "notes.md")}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out
+    entry = parsed["files"][0]
+    assert entry["matches_live"] is None
+    assert "deleted" in entry["reason"]
+    assert parsed["summary"]["missing_live"] == 1
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": parsed["scratch_dir"], "confirm": True}, cfg=cfg)
+    committed = json.loads(out)
+    assert committed["ok"] is True, out
+    assert (source_tree / "notes.md").exists()  # file back from the snapshot
+
+
+def test_commit_refuses_without_confirm(data_root, tmp_path, source_tree):
+    cfg = make_cfg(tmp_path, source_tree)
+    out = tools.handle("backup_restore_commit", {"target_dir": str(engine.plugin_data_dir())}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False
+    assert "confirm" in parsed["error"]
+
+
+def test_commit_confirm_must_be_literal_true(data_root, tmp_path, source_tree):
+    """Fix-round-1 P1: ``confirm`` accepts ONLY the literal boolean true.
+
+    ``bool(args.get("confirm"))`` turned any nonempty string ("false", "no")
+    into approval and then handed the engine a literal True, so the engine's
+    own gate could never catch it. Truthy-but-not-true values are refused."""
+    cfg = make_cfg(tmp_path, source_tree)
+    target = engine.plugin_data_dir() / "gate-probe"  # must never be touched
+    for bad in ("true", "false", "yes", 1):
+        out = tools.handle("backup_restore_commit",
+                           {"target_dir": str(target), "confirm": bad}, cfg=cfg)
+        parsed = json.loads(out)
+        assert parsed["ok"] is False, (bad, out)
+        # the TOOL gate must be the one refusing (never the engine's dir check)
+        assert "refusing to overwrite live files" in parsed["error"], (bad, out)
+        assert not target.exists(), (bad, out)
+
+
+def test_commit_refuses_target_outside_plugin_data(data_root, tmp_path, source_tree):
+    cfg = make_cfg(tmp_path, source_tree)
+    scratch = tmp_path / "somewhere-else"
+    scratch.mkdir()
+    out = tools.handle("backup_restore_commit", {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False
+    assert "plugin data dir" in parsed["error"]
+
+
+def test_commit_replaces_live_with_safety_copy(data_root, tmp_path, plugin_env,
+                                               source_tree, local_repo):
+    """Full roundtrip: backup → snapshot → drift live → restore scratch →
+    commit → live file back to snapshot content; pre-commit safety copy
+    preserved the DRIFTED content first."""
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    cycle_ok(cfg)
+    live = source_tree / "config.yaml"
+    drifted = "drifted content\n"
+    live.write_text(drifted)
+    out = tools.handle("backup_restore", {"path": str(live)}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True and parsed["files"][0]["matches_live"] is False
+
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": parsed["scratch_dir"], "confirm": True}, cfg=cfg)
+    committed = json.loads(out)
+    assert committed["ok"] is True, out
+    assert live.read_text() == "display:\n  skin: default\n"  # snapshot content back
+    safety = committed["safety_snapshot"]["files"]
+    assert safety and safety[0]["path"] == str(live)
+    from pathlib import Path
+    assert Path(safety[0]["safety_copy"]).read_text() == drifted  # reversible commit
+    assert committed["committed"][0]["verified"] is True
+
+
+def test_commit_skips_outside_source(data_root, tmp_path, source_tree):
+    cfg = make_cfg(tmp_path, source_tree)
+    scratch = engine.plugin_data_dir() / "restore-scratch" / "manual"
+    (scratch / "etc").mkdir(parents=True)
+    (scratch / "etc" / "passwd").write_text("root:x:0:0\n")
+    out = tools.handle("backup_restore_commit", {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False  # nothing committable: the only file is outside source
+    assert parsed["skipped"] and parsed["skipped"][0]["reason"] == "outside source tree"
+
+
+# ── fix round 1, P1#6: never commit over a live SQLite DB with WAL sidecars ──
+
+def test_commit_skips_sqlite_db_with_live_wal_sidecars(data_root, tmp_path, source_tree):
+    """P1#6: copying a snapshot-restored DB over a LIVE open SQLite database
+    (its -wal/-shm sidecars exist) can tear the DB — the commit refuses the
+    DB with quiesce guidance; unrelated files still commit."""
+    cfg = make_cfg(tmp_path, source_tree)
+    scratch = engine.plugin_data_dir() / "scratch" / "wal-restore"
+    live_rel = str(source_tree).lstrip("/")
+    db_dir = scratch / live_rel
+    db_dir.mkdir(parents=True)
+    (db_dir / "state.db").write_bytes(b"restored-db-bytes")
+    (db_dir / "notes.md").write_text("restored notes\n")
+    # live WAL sidecars prove the agent has this DB open right now
+    (source_tree / "state.db-wal").write_bytes(b"wal")
+    (source_tree / "state.db-shm").write_bytes(b"shm")
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out  # the non-DB commit path stays as designed
+    assert (source_tree / "notes.md").read_text() == "restored notes\n"
+    skipped = [s for s in parsed["skipped"] if "state.db" in s["path"]]
+    assert skipped, parsed
+    assert "WAL" in skipped[0]["reason"] and "quiesce" in skipped[0]["reason"]
+    with open(source_tree / "state.db", "rb") as f:
+        assert f.read(15) == b"SQLite format 3"  # live DB untouched
+
+
+def test_commit_fails_when_only_wal_guarded_db_in_scratch(data_root, tmp_path,
+                                                          source_tree):
+    """P1#6: when the ONLY scratch file is a WAL-guarded DB, the commit is a
+    refusal (nothing committed), with the quiesce reason carried in skipped."""
+    cfg = make_cfg(tmp_path, source_tree)
+    scratch = engine.plugin_data_dir() / "scratch" / "wal-only"
+    db_dir = scratch / str(source_tree).lstrip("/")
+    db_dir.mkdir(parents=True)
+    (db_dir / "state.db").write_bytes(b"restored-db-bytes")
+    (source_tree / "state.db-wal").write_bytes(b"wal")
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False, out
+    assert not parsed["committed"], parsed
+    skipped = [s for s in parsed["skipped"] if "state.db" in s["path"]]
+    assert skipped and "quiesce" in skipped[0]["reason"]
+    with open(source_tree / "state.db", "rb") as f:
+        assert f.read(15) == b"SQLite format 3"
+
+
+# ── fix round 1, P1#1: custom restore targets confined to the scratch root ───
+
+def _shimmed_r2(shim_state):
+    """Fake-ready r2 leg (shim answers every command with rc 0 — restic is
+    never really launched, so a red run cannot write anywhere)."""
+    write_state(shim_state, fake_all=True, snapshots=snapshot_fixture())
+
+
+def test_restore_refuses_target_outside_scratch_root(data_root, tmp_path,
+                                                     plugin_env, source_tree,
+                                                     restic_shim, shim_state,
+                                                     shim_calls):
+    """P1#1: target_dir='/' forwarded to 'restic restore --target' wrote files
+    at their original LIVE paths, bypassing confirm + the pre-commit safety
+    copy. Any target outside <plugin-data>/scratch/ is refused BEFORE restic."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    for bad in ("/", "/etc", str(tmp_path / "elsewhere-restore")):
+        out = tools.handle("backup_restore",
+                           {"path": str(source_tree / "config.yaml"), "target_dir": bad,
+                            "leg": "r2"},
+                           cfg=cfg)
+        parsed = json.loads(out)
+        assert parsed["ok"] is False, (bad, out)
+        assert "scratch" in parsed["error"], (bad, out)
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]], \
+        "restic restore must never be launched with an unconfined target"
+
+
+def test_restore_refuses_symlink_escape_target(data_root, tmp_path, plugin_env,
+                                               source_tree, restic_shim,
+                                               shim_state, shim_calls):
+    """P1#1: a symlink inside the scratch root pointing OUTSIDE is an escape —
+    refused; restic is never launched."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    link = engine.plugin_data_dir() / "scratch" / "escape"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(tmp_path, target_is_directory=True)  # EXISTING outside dir
+    out = tools.handle("backup_restore",
+                       {"path": str(source_tree / "config.yaml"), "target_dir": str(link),
+                        "leg": "r2"},
+                       cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False, out
+    assert "scratch" in parsed["error"], out
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]]
+
+
+def test_restore_refuses_nonempty_existing_target(data_root, tmp_path, plugin_env,
+                                                  source_tree, restic_shim,
+                                                  shim_state, shim_calls):
+    """P1#1: custom targets must be EMPTY or new — a dirty dir would let restic
+    merge restored bytes into unknown content."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    taken = engine.plugin_data_dir() / "scratch" / "taken"
+    (taken / "junk").mkdir(parents=True)
+    (taken / "junk" / "f").write_text("x")
+    out = tools.handle("backup_restore",
+                       {"path": str(source_tree / "config.yaml"), "target_dir": str(taken),
+                        "leg": "r2"},
+                       cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is False, out
+    assert "empty" in parsed["error"], out
+    assert not [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]]
+
+
+def test_restore_accepts_custom_target_under_scratch_root(data_root, tmp_path,
+                                                          plugin_env, source_tree,
+                                                          restic_shim, shim_state,
+                                                          shim_calls):
+    """P1#1 positive: an empty, new dir inside <plugin-data>/scratch/ is a
+    valid custom target and is passed through to --target verbatim."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    target = engine.plugin_data_dir() / "scratch" / "my-restore"
+    out = tools.handle("backup_restore",
+                       {"path": str(source_tree / "config.yaml"), "target_dir": str(target),
+                        "leg": "r2"},
+                       cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out
+    assert parsed["scratch_dir"] == str(target)
+    restores = [c for c in read_calls(shim_calls) if c["argv"][:1] == ["restore"]]
+    assert len(restores) == 1, restores
+    argv = restores[0]["argv"]
+    assert argv[argv.index("--target") + 1] == str(target)
+    assert "--verify" in argv
+
+
+def test_restore_default_target_is_fresh_dir_under_scratch_root(data_root,
+                                                                tmp_path,
+                                                                plugin_env,
+                                                                source_tree,
+                                                                restic_shim,
+                                                                shim_state):
+    """P1#1: the default (no target_dir) remains a fresh scratch dir — now
+    under the same <plugin-data>/scratch/ root."""
+    _shimmed_r2(shim_state)
+    cfg = make_cfg(tmp_path, source_tree, r2=True)
+    out = tools.handle("backup_restore", {"path": str(source_tree / "config.yaml"),
+                                          "leg": "r2"}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out
+    assert parsed["scratch_dir"].startswith(str(engine.plugin_data_dir() / "scratch"))
+
+
+def test_commit_error_enumerates_already_replaced_files(data_root, tmp_path,
+                                                        plugin_env,
+                                                        source_tree,
+                                                        local_repo,
+                                                        monkeypatch):
+    """QA N-8: a mid-loop OSError in restore_commit (say, the second file's
+    copy fails) surfaced a bare error — the caller could not tell WHICH files
+    were already replaced over live, nor that the pre-commit safety copies
+    exist for manual rollback. The error result now carries the enumeration
+    AND the safety snapshot."""
+    cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
+    cycle_ok(cfg)
+    (source_tree / "config.yaml").write_text("drift-1\n")
+    (source_tree / "notes.md").write_text("drift-2\n")
+
+    out = tools.handle("backup_restore", {"path": str(source_tree)}, cfg=cfg)
+    parsed = json.loads(out)
+    assert parsed["ok"] is True, out  # whole-tree restore into scratch
+
+    real_copy2 = engine.shutil.copy2
+    live_copies = {"n": 0}
+
+    def flaky(src, dst, *args, **kwargs):
+        if str(dst).startswith(str(source_tree)):
+            live_copies["n"] += 1
+            if live_copies["n"] == 2:  # second LIVE replacement fails
+                raise OSError("simulated disk full mid-commit")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(engine.shutil, "copy2", flaky)
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": parsed["scratch_dir"], "confirm": True}, cfg=cfg)
+    res = json.loads(out)
+    assert res["ok"] is False, out
+    assert "Already replaced" in res["error"], res  # the enumeration, in words
+    assert len(res.get("committed") or []) == 1, res  # exactly one replacement made it
+    replaced = res["committed"][0]["path"]
+    assert replaced in res["error"], res            # named in the error text
+    assert replaced.startswith(str(source_tree)), res
+    assert "simulated disk full" in res["error"], res
+    assert "Safety copies" in res["error"] and "manual rollback" in res["error"], res
+    assert res.get("safety_snapshot", {}).get("dir"), res  # rollback pointer present
+
+
+# ── fix round 3, Greptile P2: rollback state survives EVERY failure point ────
+#
+# The per-file restore op is: safety-copy the live file → ensure the live
+# parent dir → copy the restored file over live. The round-2 N-8 guard only
+# wrapped the OVERWRITE copy; a failure at the safety-copy step or the
+# parent-dir step mid-restore escaped restore_commit entirely and tools'
+# never-raise wrapper answered a bare "unexpected failure" — the caller lost
+# the list of already-replaced files AND the safety copies needed to undo
+# them. Both new tests prove the envelope carries `committed` +
+# `safety_snapshot` for files already processed, no matter which step fails.
+
+def _two_file_scratch(scratch, live_rel):
+    """A minimal scratch restore: two files, both with live counterparts."""
+    for name in ("a.txt", "b.txt"):
+        p = scratch / live_rel / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"restored-{name}\n")
+
+
+def test_commit_error_carries_rollback_state_on_safety_copy_failure(
+        data_root, tmp_path, source_tree, monkeypatch):
+    """Greptile fix-round-3 P2: the SAFETY-COPY step fails mid-restore (after
+    an earlier file was already replaced) — the error envelope must still
+    carry `committed` + `safety_snapshot` so the caller can undo, not a bare
+    'unexpected failure'."""
+    cfg = make_cfg(tmp_path, source_tree)
+    live_rel = str(source_tree).lstrip("/")
+    scratch = engine.plugin_data_dir() / "scratch" / "safety-fail"
+    _two_file_scratch(scratch, live_rel)
+    (source_tree / "a.txt").write_text("live-a\n")
+    (source_tree / "b.txt").write_text("live-b\n")
+
+    real_copy2 = engine.shutil.copy2
+    safety_copies = {"n": 0}
+
+    def flaky(src, dst, *args, **kwargs):
+        if "pre-commit-" in str(dst):
+            safety_copies["n"] += 1
+            if safety_copies["n"] == 2:  # SECOND safety copy fails
+                raise OSError("simulated safety-copy failure")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(engine.shutil, "copy2", flaky)
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    res = json.loads(out)
+    assert res["ok"] is False, out
+    committed = res.get("committed") or []
+    assert [c["path"] for c in committed] == [str(source_tree / "a.txt")], res
+    snap = res.get("safety_snapshot") or {}
+    assert snap.get("dir"), res
+    assert [f["path"] for f in (snap.get("files") or [])] == \
+        [str(source_tree / "a.txt")], res
+    assert "commit interrupted" in res["error"], res
+    assert "simulated safety-copy failure" in res["error"], res
+    # nothing beyond the failure point was touched
+    assert (source_tree / "b.txt").read_text() == "live-b\n"
+
+
+def test_commit_error_carries_rollback_state_on_parent_dir_failure(
+        data_root, tmp_path, source_tree):
+    """Greptile fix-round-3 P2: a PARENT-DIR creation failure mid-restore (a
+    regular FILE blocking the mkdir of a live parent) — same contract: the
+    envelope carries `committed` + `safety_snapshot` for files already
+    replaced. Real filesystem, no mocks."""
+    cfg = make_cfg(tmp_path, source_tree)
+    live_rel = str(source_tree).lstrip("/")
+    scratch = engine.plugin_data_dir() / "scratch" / "parent-blocked"
+    (source_tree / "a.txt").write_text("live-a\n")
+    (source_tree / "blocker").write_text("not a directory\n")  # blocks mkdir
+    (scratch / live_rel / "a.txt").parent.mkdir(parents=True, exist_ok=True)
+    (scratch / live_rel / "a.txt").write_text("restored-a\n")
+    blocked = scratch / live_rel / "blocker" / "b.txt"  # live = <source>/blocker/b.txt
+    blocked.parent.mkdir(parents=True)
+    blocked.write_text("restored-b\n")
+
+    out = tools.handle("backup_restore_commit",
+                       {"target_dir": str(scratch), "confirm": True}, cfg=cfg)
+    res = json.loads(out)
+    assert res["ok"] is False, out
+    committed = res.get("committed") or []
+    assert [c["path"] for c in committed] == [str(source_tree / "a.txt")], res
+    snap = res.get("safety_snapshot") or {}
+    assert snap.get("dir"), res
+    assert [f["path"] for f in (snap.get("files") or [])] == \
+        [str(source_tree / "a.txt")], res
+    assert "commit interrupted" in res["error"], res
+    # the blocker file survived; the failed file was never written
+    assert (source_tree / "blocker").read_text() == "not a directory\n"
+    assert not (source_tree / "blocker" / "b.txt").exists()
