@@ -496,3 +496,28 @@ def test_find_node_survives_a_nodeless_path(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", boom)
     assert _find_node() is None
+
+
+def test_p2_run_tone_warn_is_warn_not_bad(tmp_path, node_available):
+    """Greptile round-4 P2 regression: the engine's WARN cycle verdict —
+    backups succeeded but a later check failed, or only some legs
+    succeeded — must render as a warning, never as a failure. Asserted
+    on the pane's Last-cycle StatusDot tone (the chip carries no run dot)."""
+    if node_available is None:
+        pytest.skip("node not available for the render harness")
+    now = int(time.time())
+    scenarios = [
+        # (name, last_run status, expected tone, forbidden tone)
+        ("WARN cycle → warn (backups ok, later check failed)", "WARN", "warn", "bad"),
+        ("OK cycle → good", "OK", "good", None),
+        ("SKIP cycle → warn", "SKIP", "warn", None),
+        ("FAIL cycle → bad", "FAIL", "bad", None),
+    ]
+    for name, status, expected, forbidden in scenarios:
+        st = _chip_status([])
+        st["last_run"] = {"status": status, "epoch": now - 120}
+        out = _render(tmp_path, node_available, st)
+        pane_tones = [t for t in out["pane"] if t.startswith("@tone:")]
+        assert pane_tones[0] == f"@tone:{expected}", f"{name}: {pane_tones}"
+        if forbidden:
+            assert f"@tone:{forbidden}" not in pane_tones, name

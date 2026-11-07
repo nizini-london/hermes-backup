@@ -257,7 +257,7 @@ function makePane(ctx) {
     const lastRun = st.last_run || null
     const runTone = !lastRun
       ? 'muted'
-      : lastRun.status === 'OK' ? 'good' : lastRun.status === 'SKIP' ? 'warn' : 'bad'
+      : lastRun.status === 'OK' ? 'good' : ['SKIP', 'WARN'].includes(lastRun.status) ? 'warn' : 'bad'
     const drill = st.last_drill || null
     const drillTone = !drill
       ? 'muted'
