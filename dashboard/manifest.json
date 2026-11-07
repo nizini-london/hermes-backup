@@ -1,0 +1,8 @@
+{
+  "name": "hermes-backup",
+  "label": "Hermes Backup",
+  "description": "Live status of the encrypted restic backup legs (local + offsite): snapshot age, RPO state, last cycle verdict, and the last DR drill result",
+  "icon": "Shield",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}

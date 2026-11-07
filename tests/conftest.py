@@ -8,11 +8,18 @@
   the engine's rule-11 helper falls back to in standalone mode.
 - ``restic_shim``: a fake restic for s3: repos on PATH (transparent proxy to
   the real /usr/bin/restic for local repos), recording every invocation.
+- ``node_available``: the node binary, or None when this machine has none
+  (the render tests skip in that one case; see tests/test_render.py's
+  docstring — dependency-wise the suite has nothing to skip on).
+
+Widget fixtures appended after the engine's: union resolution of the
+engine x widget add/add on this file (cold-review gate round 2).
 """
 
 import json
 import os
 import stat
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -250,3 +257,18 @@ def snapshot_fixture(epoch_time: str = "2026-11-05T09:00:00.123456789Z",
         "paths": ["/home/test/hermes-home"], "hostname": "test", "tags": [],
         "summary": {"total_bytes_processed": 1234},
     }]
+
+
+@pytest.fixture(scope="session")
+def node_available():
+    """The node binary, or None when this machine has none (the render
+    tests skip in that one case; see tests/test_render.py's docstring —
+    dependency-wise the suite has nothing to skip on)."""
+    for candidate in ("node", "/usr/bin/node"):
+        try:
+            proc = subprocess.run([candidate, "--version"], capture_output=True, text=True)
+            if proc.returncode == 0:
+                return candidate
+        except OSError:
+            continue
+    return None
