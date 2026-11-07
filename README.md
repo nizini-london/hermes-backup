@@ -52,13 +52,20 @@ byte-compares it against the live file, and records a dated PASS/FAIL verdict.
      home.
 3. **Provide secrets** — `restic_password`, plus `r2_access_key` /
    `r2_secret_key` if you use the offsite leg. They are stored through Hermes'
-   secret storage; never in env files, never logged, never echoed back.
+   secret storage; never logged, never echoed back, and the plugin code never
+   reads credential files. One by-design exception: the standalone scheduled
+   cycle runs outside Hermes and takes its credentials from the machine — on
+   Linux from an optional env file you maintain (the unit names it), on macOS
+   from a password file you create (the plist points at it; see Disclosure).
 4. **Initialize the repositories** — `backup_setup` runs `restic init` on
    demand.
 5. **Schedule it** — `backup_setup` prints a systemd user unit + timer (Linux)
    or a launchd plist (macOS) for your cadence, plus a `hermes cron add`
    one-liner as the cross-platform alternative. The unit file is written only
    when you explicitly ask (`install: true`) — nothing is installed silently.
+   macOS note: secrets never ride the plist. Keep the local leg primary and
+   cover the offsite leg with the Hermes cron one-liner — the S3 keys cannot
+   be injected under `launchd`.
 6. **First backup, then first drill** — call `backup_now`, and once a snapshot
    exists, call `backup_drill`. If the drill doesn't PASS, you don't have a
    backup yet — you have a hypothesis.
@@ -150,8 +157,16 @@ This plugin takes the following actions, so you can decide with open eyes:
   `install: true`. On macOS it prints a launchd plist for you to install.
   Nothing is installed silently.
 - **Secrets**: the repository password and S3 keys are stored through Hermes'
-  secret storage (plugin config secrets). They are never written to env files,
-  never logged, and never included in tool output.
+  secret storage (plugin config secrets) — never logged, never included in tool
+  output, and the plugin code never opens a credential file. The one exception
+  is the standalone scheduled cycle: it runs outside Hermes, and each OS
+  delivers credentials its own way. On Linux the unit declares an optional
+  `EnvironmentFile=` — the env file you maintain; `backup_setup` warns when it
+  is absent and a missing file fails the cycle visibly in `status` — never
+  silently. On macOS, `launchd` has no env-file mechanism: the generated plist
+  instead carries a `RESTIC_PASSWORD_FILE` reference pointing at a password
+  file you create (`chmod 600`, `~/.config/hermes-backup/restic-password`),
+  which `Secrets.load` reads directly in standalone mode.
 
 ## Requirements
 
