@@ -2,6 +2,10 @@ name: hermes-backup
 version: 0.1.0
 manifest_version: 2
 api_version: 1
+# QA N4: the lowest Hermes release every consumed core API is verified on —
+# agent.secret_scope.get_secret, plugins.plugin_storage.plugin_data_dir,
+# hermes_cli.config cfg_get/load_config, hermes_constants.get_hermes_home.
+requires_hermes: ">=0.22.5"
 description: >
   Encrypted restic backup and verified restore for the Hermes home. Dual-target
   (local disk + any S3-compatible bucket such as Cloudflare R2), 5-minute-class

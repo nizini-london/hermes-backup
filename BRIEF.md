@@ -94,17 +94,28 @@ with "a cycle is running" instead of blocking.
    (default: fresh scratch dir under plugin_data_dir). Restores INTO SCRATCH,
    never over the live tree. Returns: file list, byte sizes, sha256 of each
    restored file, and the live counterpart's sha256 + a `matches_live` verdict
-   per file. Refuses paths outside the source tree.
+   per file. `matches_live` is INFORMATIONAL, never a gate: `null` when no live
+   counterpart exists (deleted file — expected), `false` with reason when the
+   live file differs (a damaged file's restore is the repair — expected). The
+   only hard guarantees are restic's own integrity (restored bytes == snapshot
+   content), path confinement, and scratch-first. Refuses paths outside the
+   source tree.
 6. **`backup_restore_commit`** — after the user has seen/verified a scratch
    restore: copy restored files into place (requires explicit `confirm: true`
    param; refuses without it). Pre-commit: make a one-shot safety snapshot of
    any live file being replaced (restic backup --stdin or copy to plugin_data_dir).
-   This is the "never restore over live files" discipline, encoded.
+   This is the "never restore over live files" discipline, encoded. The gate is
+   explicit confirm + the user seeing the scratch result — NEVER
+   `matches_live == true`, which would block legitimate recovery of
+   deleted/damaged files.
 7. **`backup_drill`** — the creativity edge, straight from the ops reference:
    (a) report last snapshot age both legs, (b) structural check both legs,
-   (c) pick one small real file, `restic dump` it from EACH leg into scratch,
-   byte-compare vs live, (d) PASS/FAIL per step, (e) append a `DRILL <date>
-   <verdict> driver=<who>` line to the log. `deep: true` adds full
+   (c) pick one small real file UNCHANGED since the snapshot being tested
+   (mtime predating the snapshot, or byte-identical across the two most recent
+   snapshots of that path), `restic dump` it from EACH leg into scratch,
+   byte-compare vs live — a mismatch on a changed file is `file_pick_mismatch`
+   (re-pick, never "backup broken"), (d) PASS/FAIL per step, (e) append a
+   `DRILL <date> <verdict> driver=<who>` line to the log. `deep: true` adds full
    `--read-data` on the local leg with a loud warning it can take many minutes
    (never make this the default). Steps strictly sequential; check no restic
    cycle is running before each (pgrep), never launch a step into an
