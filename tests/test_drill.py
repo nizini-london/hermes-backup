@@ -1,5 +1,5 @@
 """DR drill: sequential steps, dump+byte-compare from EACH leg, PASS/FAIL
-per step, DRILL log line, deep flag, pgrep refusal while a cycle runs."""
+per step, DRILL log line, repo-scoped busy refusal while a cycle runs."""
 
 import json
 import os
@@ -245,22 +245,27 @@ def test_drill_no_deep_by_default(data_root, tmp_path, plugin_env, source_tree,
     assert local_checks and "--read-data" not in local_checks[0]["argv"]
 
 
-def test_drill_refuses_steps_while_restic_runs(data_root, tmp_path, plugin_env,
-                                               source_tree, local_repo, real_pgrep):
-    """pgrep restic → every step refuses (never launch into a locked repo)."""
+def test_drill_refuses_steps_while_our_repo_is_busy(data_root, tmp_path, plugin_env,
+                                                    source_tree, local_repo, real_guard):
+    """A restic process FOR OUR repository → every step refuses (never launch
+    into a locked repo). Foreign-repo processes never reach this — the cycle
+    tests prove the repo scoping."""
     fake_bin = engine.plugin_data_dir() / "fake-restic-drill"
     fake_bin.mkdir(parents=True, exist_ok=True)
     proc_path = fake_bin / "restic"
-    shutil.copy2("/bin/sleep", proc_path)
-    process = subprocess.Popen([str(proc_path), "30"],
+    # /bin/bash, not /bin/sleep: sleep is a coreutils multicall binary here —
+    # exec'd as 'restic' it exits instantly; bash stays alive under the name.
+    shutil.copy2("/bin/bash", proc_path)
+    process = subprocess.Popen([str(proc_path), "-c", "sleep 30; sleep 30"],
+                               env={**os.environ, "RESTIC_REPOSITORY": str(local_repo)},
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(0.3)
-        real_pgrep()
+        real_guard()
         cfg = make_cfg(tmp_path, source_tree, local_repo=str(local_repo))
         parsed = json.loads(tools.handle("backup_drill", {"file": str(source_tree / "config.yaml")}, cfg=cfg))
         assert parsed["verdict"] == "FAIL"
-        assert all("restic cycle is running" in s["detail"] for s in parsed["steps"])
+        assert all("already running" in s["detail"] for s in parsed["steps"])
     finally:
         process.terminate()
         process.wait(timeout=5)

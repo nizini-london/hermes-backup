@@ -16,7 +16,11 @@ table) to a plugin engine:
   prune AND the data check succeeded records "completed" and closes the slot;
 - hot SQLite databases are shadow-copied INSIDE the backup source tree
   (``<source>/.db-shadow/``) before a cycle and cleaned up after it;
-- single-instance cycles via a non-blocking lockfile in the plugin data dir;
+- single-instance cycles via a non-blocking lockfile in the plugin data dir,
+  plus a REPO-SCOPED busy guard (restic's own lock files + restic processes
+  referencing this config's repositories) so a foreign restic stack on the
+  same machine — different home, different repository — never blocks or is
+  blocked by this plugin;
 - cycle log under the plugin data dir, verdict lines parseable by
   ``LOG_VERDICT_RE`` over a 64KB tail (verdict-to-EOF distance grows without
   bound, so a fixed small tail intermittently misses every verdict).
@@ -44,7 +48,7 @@ from contextlib import closing
 from xml.sax.saxutils import escape as xml_escape
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 logger = logging.getLogger("hermes-backup")
 
@@ -423,14 +427,147 @@ def acquire_cycle_lock(timeout: float = 0.0) -> Any:
     return fd
 
 
-def restic_process_running() -> bool:
-    """True when any restic process is running (``pgrep -x restic``)."""
+def _proc_available() -> bool:
+    """/proc exists (Linux). macOS has none — the ps fallback covers it."""
+    return Path("/proc/self").exists()
+
+
+def _pid_blob_proc(pid: str) -> str:
+    """Command line + environment text for ``pid`` from /proc (Linux).
+
+    The repository travels to restic via ``RESTIC_REPOSITORY`` (``Leg.env``),
+    not argv, so the environment must be part of the fingerprint; the command
+    line covers invocations that pass ``--repo`` explicitly. Unreadable or
+    missing entries (race with process exit) yield "".
+    """
+    parts = []
+    for fname in ("cmdline", "environ"):
+        try:
+            raw = Path(f"/proc/{pid}/{fname}").read_bytes()
+        except OSError:
+            continue
+        parts.append(raw.replace(b"\0", b" ").decode("utf-8", "replace"))
+    return " \n ".join(parts)
+
+
+def _pid_blobs_ps(pids: list[str]) -> list[str]:
+    """Non-Linux fallback: ps instead of /proc.
+
+    argv via ``ps -axo pid=,command=`` (BSD and procps), environment via BSD
+    ``ps -E -p`` — same-user processes only, which is who this guard is for
+    (the scheduler's own cycles and the user's other restic stacks; other
+    users' environments need root and stay invisible). The ENTIRE ``ps -E``
+    output is appended so the match works regardless of the column layout.
+    """
+    blobs = {pid: "" for pid in pids}
+    try:
+        proc = subprocess.run(["ps", "-axo", "pid=,command="],
+                              capture_output=True, text=True, timeout=10)
+        for line in (proc.stdout or "").splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if pid in blobs:
+                blobs[pid] = command
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for pid in pids:
+        try:
+            proc = subprocess.run(["ps", "-E", "-p", pid],
+                                  capture_output=True, text=True, timeout=10)
+            blobs[pid] += " \n " + (proc.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return [blobs[pid] for pid in pids]
+
+
+def _restic_pid_blobs(pids: list[str]) -> list[str]:
+    """Command line + environment text per restic pid (best effort).
+
+    /proc on Linux; the ps fallback where /proc is absent (macOS). The blobs
+    exist ONLY for the repo match in :func:`restic_process_running` — they
+    can carry other processes' secret environment (RESTIC_PASSWORD, AWS
+    keys) and must never be logged, returned, or persisted.
+    """
+    if _proc_available():
+        return [_pid_blob_proc(pid) for pid in pids]
+    return _pid_blobs_ps(pids)
+
+
+def restic_process_running(repos: Sequence[str] = ()) -> bool:
+    """True when a restic process runs against one of ``repos``.
+
+    ``repos`` holds the restic repository identifiers of THIS configuration
+    (the local repo path and the ``s3:`` offsite URL). A process counts only
+    when its command line or ``RESTIC_REPOSITORY`` environment references one
+    of them — the drill-round-1 fix: a bare ``pgrep -x restic`` is
+    machine-global, so a foreign production stack (different home, different
+    repository) blocked this plugin's cycle. With no ``repos`` the legacy
+    machine-global semantics remain; no production caller uses that — it is
+    the explicit seam tests patch and a manual-diagnosis convenience.
+    """
     try:
         proc = subprocess.run(["pgrep", "-x", RESTIC_BINARY],
                               capture_output=True, text=True, timeout=10)
-        return proc.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False  # pgrep unavailable → cannot assert; do not block on a guess
+    if proc.returncode != 0:
+        return False
+    pids = [p for p in (proc.stdout or "").split() if p.isdigit()]
+    if not repos:
+        return bool(pids)
+    return any(any(repo in blob for repo in repos)
+               for blob in _restic_pid_blobs(pids))
+
+
+def repo_lock_files(repo: str) -> list[str]:
+    """Restic's own lock files for a local repository (``<repo>/locks/``).
+
+    Restic creates one for every lock-taking operation (backup, check,
+    prune) and removes it on clean exit. The real layout (verified against
+    restic 0.18.1): files are named by their 64-character hex id with NO
+    extension (transient ``<id>.tmp`` files can appear while a lock is
+    created) — so ANY entry in ``locks/`` counts as busy; an empty or absent
+    directory is idle. They live INSIDE the repository, so the signal is
+    repo-scoped by construction — restic's own source of truth. On a
+    repository shared across hosts the lock file is the ONLY signal: a
+    restic process on the other host is invisible to local pgrep, so its
+    lock is all that stands between this drill and a concurrent
+    maintenance run. Lock file contents are encrypted; existence is the
+    signal. This plugin's read commands run with ``--no-lock`` and never
+    create one.
+    """
+    try:
+        return sorted(p.name for p in (Path(repo) / "locks").iterdir())
+    except OSError:
+        return []
+
+
+def cycle_busy_reason(cfg: Config) -> Optional[str]:
+    """Why a cycle/drill step must not start on THIS config's repositories.
+
+    Repo-scoped busy guard (drill-round-1 fix), two signals:
+    1. restic's own lock files in the local repository — primary, repo-scoped
+       by construction (also covers a crashed cycle's stale lock; ``restic
+       unlock`` clears it);
+    2. live restic processes whose command line or ``RESTIC_REPOSITORY``
+       environment references one of this config's repositories — belt and
+       braces for the window before a lock file appears and for the offsite
+       leg, whose locks cannot be inspected locally.
+
+    A foreign restic stack backing up a DIFFERENT repository never blocks
+    this one. Returns None when the legs are idle or unconfigured.
+    """
+    local_repo = cfg.leg("local") or ""
+    repos = [repo for repo in (cfg.leg("local"), cfg.leg("r2")) if repo]
+    if not repos:
+        return None
+    if local_repo and repo_lock_files(local_repo):
+        return (f"restic lock files present in {local_repo}/locks/ — a cycle "
+                f"may be active there; if a previous cycle crashed, "
+                f"`restic unlock {local_repo}` clears the stale lock")
+    if restic_process_running(repos):
+        return ("a restic cycle is already running for this repository "
+                f"({', '.join(repos)})")
+    return None
 
 
 # ── cycle log ────────────────────────────────────────────────────────────────
@@ -879,7 +1016,9 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
     """One full snapshot cycle: shadow DBs → backup per leg → throttled
     prune + 2% sample → structural check of the offsite leg, every cycle.
 
-    Single-instance (lockfile + pgrep); busy cycles SKIP cleanly instead of
+    Single-instance (plugin lockfile + repo-scoped busy guard: restic's own
+    lock files and this config's restic processes — a foreign restic stack on
+    a different repository never blocks); busy cycles SKIP cleanly instead of
     blocking. Per-leg independence: one leg's failure never gates the other.
     """
     cfg = cfg or load_config()
@@ -906,9 +1045,10 @@ def run_cycle(cfg: Optional[Config] = None, prune: str = "auto",
                 "legs": {}, "now_epoch": int(time.time())}
 
     try:
-        if restic_process_running():
+        busy = cycle_busy_reason(cfg)
+        if busy:
             return {"verdict": "skip", "skipped": True,
-                    "reason": "a restic cycle is already running (pgrep restic)",
+                    "reason": busy,
                     "legs": {}, "now_epoch": int(time.time())}
 
         source = cfg.source
@@ -1308,19 +1448,20 @@ def run_drill(cfg: Optional[Config] = None, deep: bool = False,
     Verdict taxonomy: per-step PASS / FAIL / SKIP, plus ``file_pick_mismatch``
     — a distinct NON-failure outcome for "the dumps came back fine but no
     candidate could be verified against live". One mismatched file is never
-    evidence of a broken backup. Steps strictly sequential; ``pgrep restic``
-    before each — never launch a step into an already-locked repo. ``deep``
-    adds a full ``--read-data`` check of the local leg (loud warning: can
-    take many minutes).
+    evidence of a broken backup. Steps strictly sequential; the repo-scoped
+    busy guard runs before each — never launch a step into an already-locked
+    repo. ``deep`` adds a full ``--read-data`` check of the local leg (loud
+    warning: can take many minutes).
     """
     cfg = cfg or load_config()
     secrets = secrets or Secrets.load()
     steps: list[dict] = []
 
     def step(name: str, fn) -> dict:
-        if restic_process_running():
+        busy = cycle_busy_reason(cfg)
+        if busy:
             result = {"step": name, "verdict": "FAIL",
-                      "detail": "a restic cycle is running (pgrep restic) — refusing to launch into a locked repo"}
+                      "detail": f"{busy} — refusing to launch into a locked repo"}
         else:
             try:
                 result = {"step": name, **fn()}

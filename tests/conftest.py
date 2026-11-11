@@ -46,19 +46,22 @@ TEST_PASSWORD = "test-restic-password-0123456789"
 @pytest.fixture(autouse=True)
 def no_host_restic(monkeypatch):
     """This host may run its own production restic stack on a five-minute
-    timer — tests must be isolated from it. The pgrep guard is neutralized;
-    tests that verify the guard itself re-arm the REAL check via the
-    ``real_pgrep`` fixture."""
+    timer — tests must be isolated from it. The low-level restic-process
+    detection (the repo-scoped busy guard's proc leg) is neutralized; tests
+    that verify the guard itself re-arm the REAL detection via the
+    ``real_guard`` fixture. The guard's lock-file leg (restic's own
+    ``<repo>/locks/``) stays live everywhere: per-test tmp repos never carry
+    lock files, so a live lock check cannot see the host's repos."""
     import engine
     original = engine.restic_process_running
-    monkeypatch.setattr(engine, "restic_process_running", lambda: False)
+    monkeypatch.setattr(engine, "restic_process_running", lambda repos=(): False)
     yield original
 
 
 @pytest.fixture()
-def real_pgrep(no_host_restic, monkeypatch):
-    """Re-arm the REAL ``pgrep restic`` detection (override the autouse
-    isolation) for tests that exercise the running-cycle refusal path."""
+def real_guard(no_host_restic, monkeypatch):
+    """Re-arm the REAL restic-process detection (override the autouse
+    isolation) for tests that exercise the busy-refusal paths."""
     import engine
 
     def arm():

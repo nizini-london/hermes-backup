@@ -26,6 +26,10 @@ Hermes Agent version. We aim to acknowledge within 72 hours.
   tree; it restores into a scratch directory, verifies file hashes against the
   live copies, and only `backup_restore_commit` (explicit `confirm: true`)
   copies files into place — keeping a safety snapshot of anything it replaces.
+  The `confirm: true` gate is enforced by the tool itself, and the agent is
+  the party that passes it; Hermes' default `smart` approval mode
+  auto-approves tools it classifies as safe, so a human prompt is NOT
+  guaranteed — use a stricter home approval mode if you want one.
 - **Path confinement.** Restore paths must live inside the configured backup
   source tree. Paths outside it are refused.
 - **Principle of least privilege.** The plugin shells out to `restic` (argv

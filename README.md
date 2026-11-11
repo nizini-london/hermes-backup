@@ -36,7 +36,7 @@ byte-compares it against the live file, and records a dated PASS/FAIL verdict.
 | `backup_list` | List snapshots per leg (ids, times, sizes, paths). |
 | `backup_verify` | Structural integrity check (`restic check`); optional data sampling. |
 | `backup_restore` | Restore a path **into scratch** — never over the live tree — with per-file sha256 comparison against live. |
-| `backup_restore_commit` | After you've verified a scratch restore: copy into place, snapshotting each replaced file first. Requires explicit confirmation. |
+| `backup_restore_commit` | After a scratch restore has been reviewed: copy into place, snapshotting each replaced file first. Requires the literal `confirm: true` argument — see [Approval reality](#approval-reality). |
 | `backup_drill` | The DR drill: freshness, structural checks, real restore test from each leg, PASS/FAIL verdict, logged. |
 
 ## Quick start
@@ -117,9 +117,30 @@ instead of running on every snapshot, so a 5-minute cadence stays cheap:
 
 `backup_restore` restores into a fresh scratch directory, refuses paths outside
 the source tree, and returns per-file sha256 checksums with a `matches_live`
-verdict against the live counterparts. Only after you've reviewed that output
-does `backup_restore_commit` copy files into place — it requires explicit
-confirmation, and it snapshots every live file it is about to replace first.
+verdict against the live counterparts. `backup_restore_commit` is the only step
+that copies files into place: it refuses to run without the literal
+`confirm: true` argument, and it snapshots every live file it is about to
+replace first. The confirm gate is enforced by the tool itself — who passes
+`confirm: true`, and whether a human is prompted first, is covered under
+[Approval reality](#approval-reality).
+
+### Approval reality
+
+Read this before trusting the restore gate. `backup_restore_commit` — the one
+tool that overwrites live files — has a strict, always-on agent-side gate: it
+refuses to run unless the call carries the literal boolean `confirm: true`,
+and it snapshots every live file it is about to replace first. That gate,
+however, is enforced inside the tool. The agent that is authorized to call
+the tool is also the party that passes `confirm: true`. Hermes' default
+`smart` approval mode auto-approves the tools it classifies as safe, so by
+default **no human prompt fires** before a restore commit — a human prompt
+appears only when your Hermes home runs a stricter approval mode (per-tool or
+always-ask). The plugin registration API (`ctx.register_tool`) currently
+exposes no mutating/approval hint a plugin could set to force that prompt, so
+this disclosure — not an upstream knob — is where the guarantee lives today.
+The same pattern governs `backup_setup` with `install: true`: the systemd
+unit is written only when that literal argument is present, and it is the
+agent that passes it.
 
 ## The drill
 
@@ -174,6 +195,8 @@ This plugin takes the following actions, so you can decide with open eyes:
   (`apt install restic`, `brew install restic`, …).
 - **Linux or macOS.** Scheduling uses a systemd user timer (Linux), launchd
   (macOS), or a Hermes cron job (both).
+- **WSL2** works as Linux when systemd is enabled (default on recent Windows
+  11; `/etc/wsl.conf` → `[boot] systemd=true`).
 - A Hermes installation with plugin support, and an S3-compatible bucket if you
   want the offsite leg.
 
@@ -192,8 +215,11 @@ is.
 **Can a restore accidentally overwrite my live files?**
 Not by default, and never blindly. Restores land in a scratch directory first,
 with a per-file byte comparison against the live copies. Only
-`backup_restore_commit` writes into the live tree, it requires explicit
-confirmation, and it snapshots every live file it is about to replace first.
+`backup_restore_commit` writes into the live tree: it refuses without the
+literal `confirm: true` argument and snapshots every live file it is about to
+replace first. That gate is agent-side — the agent passes `confirm: true`
+itself, and Hermes' default `smart` approval mode does not prompt you first
+(see [Approval reality](#approval-reality)).
 
 **What happens when the local drive is unmounted?**
 The local leg reports `skip` and the offsite leg keeps running — legs are
@@ -212,8 +238,11 @@ directory, and `.cache`. All configurable via the `excludes` setting.
 
 **Does the backup lock my Hermes while running?**
 No. Read commands run with `--no-lock` and fail fast instead of queueing behind
-a cycle, and a new `backup_now` refuses to start (with a clear "previous run
-active" verdict) if a cycle is already running.
+a cycle, and a new `backup_now` refuses to start (with a clear reason) when one
+of YOUR repositories is busy — restic's own lock files in the local repository,
+or a restic process whose command line or environment references your
+repositories. A restic stack for a different repository on the same machine
+never delays yours.
 
 **Can I use an S3 provider other than Cloudflare R2?**
 Yes — any S3-compatible endpoint works. Configure `r2_endpoint` and
