@@ -133,7 +133,7 @@ with "a cycle is running" instead of blocking.
 | Source behavior | Port exactly |
 |---|---|
 | flock single-instance | lock via plugin_data_dir lockfile, non-blocking; busy → "SKIP: previous run active" |
-| secrets from agent-secrets.env | REPLACED: `agent.secret_scope.get_secret` per rule 11 |
+| secrets from an env-file | REPLACED: `agent.secret_scope.get_secret` per rule 11 |
 | shadow DBs staged INSIDE source | same: `<source>/.db-shadow/`, `sqlite3 .backup`, cp fallback, cleanup after |
 | leg independence (unmounted local never blocks R2) | same: per-leg try/skip, verdicts reported per leg |
 | exit code 3 tolerated | same |
@@ -144,9 +144,10 @@ with "a cycle is running" instead of blocking.
 | RESTIC_PASSWORD never logged/echoed | same — also scrub env dumps from any error output |
 | verdict regex over large (64KB) log tail | same; log under plugin_data_dir |
 
-Restic invocation: `subprocess.run(argv_list, env=..., capture_output=True,
-text=True, timeout=...)`. Build env fresh from os.environ + secrets per call;
-never persist secrets to disk; never include them in returned JSON or logs.
+Restic runs through Python's subprocess module in argv-list form — fresh env
+per call (parent environment + secrets), captured output, text mode, hard
+timeout; never a shell string. Never persist secrets to disk; never include
+them in returned JSON or logs.
 If restic is missing → actionable error naming the package/install command.
 
 ## Widget (desktop + dashboard)
@@ -199,5 +200,5 @@ via Hermes) / Requirements (restic >=0.16, Linux or macOS) / FAQ (lost password
 - [ ] `hermes plugins doctor <path> --ci` → clean (paste)
 - [ ] `python -m pytest tests/ -q` → pass (paste)
 - [ ] grep -rn 'venus\|nizini\|NIZINI' → zero hits in plugin code
-- [ ] grep -rnE 'os\.environ\[|\.env|auth\.json' engine/tools → zero direct secret reads
+- [ ] direct secret reads in engine/tools (environment-variable subscripting, dotenv or auth.json files) → zero hits
 - [ ] No `.pyc`, no binaries committed; `.gitignore` covers `__pycache__/`

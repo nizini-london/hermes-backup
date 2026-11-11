@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import engine
-from conftest import read_calls, write_state, TEST_PASSWORD
+from conftest import read_calls, write_state, TEST_PASSPHRASE
 
 
 def make_cfg(tmp_path, source, local_repo=None, r2=False, **overrides):
@@ -26,7 +26,7 @@ def make_cfg(tmp_path, source, local_repo=None, r2=False, **overrides):
 
 
 def fresh_secrets():
-    return engine.Secrets(restic_password=TEST_PASSWORD,
+    return engine.Secrets(restic_password=TEST_PASSPHRASE,
                           r2_access_key="test-access-key",
                           r2_secret_key="test-secret-key-0123")
 
@@ -48,7 +48,7 @@ def test_real_cycle_local_repo(data_root, tmp_path, plugin_env, source_tree, loc
     ls = subprocess.run(["restic", "--repo", str(local_repo), "ls", "-l", snap,
                          "--no-lock", "--json"],
                         capture_output=True, text=True,
-                        env={**os.environ, "RESTIC_PASSWORD": TEST_PASSWORD,
+                        env={**os.environ, "RESTIC_PASSWORD": TEST_PASSPHRASE,
                              "RESTIC_CACHE_DIR": os.environ["RESTIC_CACHE_DIR"]})
     assert ls.returncode == 0, ls.stderr
     paths = [json.loads(line).get("path", "")
@@ -538,9 +538,9 @@ def test_password_never_in_output(data_root, tmp_path, plugin_env, source_tree,
                                   local_repo, restic_shim, shim_state):
     """A failing restic whose fake stderr embeds the password → scrubbed."""
     write_state(shim_state, fake_all=True, backup_rc=1,
-                backup_out=f"boom {TEST_PASSWORD} leak")
+                backup_out=f"boom {TEST_PASSPHRASE} leak")
     cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
     result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
     dumped = json.dumps(result)
-    assert TEST_PASSWORD not in dumped
+    assert TEST_PASSPHRASE not in dumped
     assert "<redacted>" in dumped  # the leaked line survives, the value does not

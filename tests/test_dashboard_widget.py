@@ -39,7 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULE_PATH = REPO_ROOT / "dashboard" / "plugin_api.py"
 DESKTOP_PATH = REPO_ROOT / "desktop" / "plugin.js"
 
-TEST_PASSWORD = "widget-test-password-xyz"
+TEST_PASSPHRASE = "widget-test-password-xyz"
 
 # The restic/S3 credential env names dashboard/plugin_api.py::_restic_env()
 # drops from the child env (cross-reference that list) — the names a status()
@@ -123,7 +123,7 @@ def tiny_repo(tmp_path_factory):
     src = base / "src"
     src.mkdir()
     (src / "note.txt").write_text("a backup you haven't restored is a hypothesis\n")
-    env = dict(os.environ, RESTIC_PASSWORD=TEST_PASSWORD)
+    env = dict(os.environ, RESTIC_PASSWORD=TEST_PASSPHRASE)
     subprocess.run(["restic", "-r", str(repo), "init"], env=env,
                    capture_output=True, text=True, check=True)
     subprocess.run(["restic", "-r", str(repo), "backup", str(src)], env=env,
@@ -142,7 +142,7 @@ def test_status_against_real_restic_repo(tmp_path, monkeypatch, tiny_repo):
                                                   "interval_minutes": 60}))
     monkeypatch.setattr(
         mod, "_secret",
-        lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
+        lambda name: TEST_PASSPHRASE if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
 
     payload = mod.status()
 
@@ -158,7 +158,7 @@ def test_status_against_real_restic_repo(tmp_path, monkeypatch, tiny_repo):
     assert isinstance(payload["now"], int) and payload["now"] > 1_000_000_000
     assert payload["schedule"]["kind"] in {"systemd", "cron", "none"}
     _assert_no_iso_strings(payload)
-    assert TEST_PASSWORD not in json.dumps(payload)
+    assert TEST_PASSPHRASE not in json.dumps(payload)
 
 
 def test_status_cache_serves_within_ttl(tmp_path, monkeypatch):
@@ -227,7 +227,7 @@ def test_slow_probe_reports_partial_inside_client_deadline(tmp_path, monkeypatch
         }))
     monkeypatch.setattr(
         mod, "_secret",
-        lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
+        lambda name: TEST_PASSPHRASE if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
 
     started = _time.monotonic()
     payload = mod.status()
@@ -243,7 +243,7 @@ def test_slow_probe_reports_partial_inside_client_deadline(tmp_path, monkeypatch
     assert "timed out" in (r2["error"] or "")
     # ...and the whole cold request finished inside the client deadline.
     assert elapsed < 15, f"cold /status took {elapsed:.1f}s (client gives 30 s)"
-    assert TEST_PASSWORD not in json.dumps(payload)
+    assert TEST_PASSPHRASE not in json.dumps(payload)
 
 
 def test_empty_repo_is_reachable_not_unreachable(tmp_path, monkeypatch):
@@ -260,7 +260,7 @@ def test_empty_repo_is_reachable_not_unreachable(tmp_path, monkeypatch):
                         lambda: _settings_config({"local_repo": str(tmp_path / "fresh-repo")}))
     monkeypatch.setattr(
         mod, "_secret",
-        lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
+        lambda name: TEST_PASSPHRASE if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
 
     payload = mod.status()
     local = payload["legs"][0]
@@ -487,7 +487,7 @@ def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch)
     shim.write_text(
         "#!/bin/sh\n"
         "if [ \"$1\" = \"snapshots\" ]; then\n"
-        f"  echo 'Fatal: wrong password: {TEST_PASSWORD}' >&2\n"
+        f"  echo 'Fatal: wrong password: {TEST_PASSPHRASE}' >&2\n"
         "  exit 10\n"
         "fi\n"
         "exit 1\n"
@@ -498,7 +498,7 @@ def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch)
                         lambda: _settings_config({"local_repo": str(tmp_path / "any-repo")}))
     monkeypatch.setattr(
         mod, "_secret",
-        lambda name: TEST_PASSWORD if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
+        lambda name: TEST_PASSPHRASE if name == "HERMES_BACKUP_RESTIC_PASSWORD" else None)
 
     before = frozenset(os.environ)  # ambient env, incl. any inherited credential
     payload = mod.status()
@@ -506,7 +506,7 @@ def test_secret_never_returned_even_when_restic_echoes_it(tmp_path, monkeypatch)
 
     assert local["configured"] is True and local["reachable"] is False
     assert "***" in (local["error"] or "")
-    assert TEST_PASSWORD not in json.dumps(payload)
+    assert TEST_PASSPHRASE not in json.dumps(payload)
     # leg independence: local's failure left the offsite leg untouched (skip)
     assert r2["configured"] is False
     # Env hygiene, scoped to status()'s own effect (QA S4): the call must

@@ -51,8 +51,8 @@ def test_launchd_plist_carries_environment_variables(data_root, tmp_path,
     pw_file = env.get("RESTIC_PASSWORD_FILE") or ""
     assert pw_file.endswith("restic-password") and pw_file.startswith("/")
     # secrets are never inlined into the plist
-    from conftest import TEST_PASSWORD
-    assert TEST_PASSWORD not in out["plist"]
+    from conftest import TEST_PASSPHRASE
+    assert TEST_PASSPHRASE not in out["plist"]
     assert "HERMES_BACKUP_R2_ACCESS_KEY" not in out["plist"]
     assert "HERMES_BACKUP_R2_SECRET_KEY" not in out["plist"]
     assert out["setup_steps"] and any("chmod 600" in s for s in out["setup_steps"])
@@ -90,14 +90,14 @@ def test_secrets_load_honors_referenced_password_file(data_root, tmp_path,
     """P1#7: RESTIC_PASSWORD_FILE (a PATH, never a value) feeds the repo
     password when the config_schema secret is absent; the env secret wins
     when both exist. This is the launchd contract."""
-    from conftest import TEST_PASSWORD
+    from conftest import TEST_PASSPHRASE
     pw_file = tmp_path / "restic-password"
-    pw_file.write_text(TEST_PASSWORD + "\n")
+    pw_file.write_text(TEST_PASSPHRASE + "\n")
     monkeypatch.delenv("HERMES_BACKUP_RESTIC_PASSWORD", raising=False)
     monkeypatch.delenv("RESTIC_PASSWORD_FILE", raising=False)
     assert engine.Secrets.load().restic_password == ""
     monkeypatch.setenv("RESTIC_PASSWORD_FILE", str(pw_file))
-    assert engine.Secrets.load().restic_password == TEST_PASSWORD
+    assert engine.Secrets.load().restic_password == TEST_PASSPHRASE
     monkeypatch.setenv("HERMES_BACKUP_RESTIC_PASSWORD", "env-wins-password-123")
     assert engine.Secrets.load().restic_password == "env-wins-password-123"
 
