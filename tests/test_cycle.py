@@ -227,27 +227,93 @@ def test_cycle_skip_when_lock_busy(data_root, tmp_path, plugin_env, source_tree,
     assert result["verdict"] == "skip"
 
 
-def test_cycle_skip_when_restic_running(data_root, tmp_path, plugin_env,
-                                        source_tree, local_repo, real_pgrep):
-    """A live restic process (real pgrep detection) makes the cycle fail
-    CLEANLY, not block."""
-    fake_bin = Path(engine.plugin_data_dir()) / "fake-restic-bin"
+def _spawn_fake_restic(dirname: str, repository: str) -> subprocess.Popen:
+    """A fake `restic` process: /bin/bash copied under the name restic —
+    pgrep -x matches the file's name (comm), and bash running
+    ``sleep 30; sleep 30`` stays alive under it. (/bin/sleep would NOT: it is
+    a coreutils multicall binary on modern distros — exec'd as 'restic' it
+    exits instantly; the pre-fix test only passed when the host's own
+    production restic happened to be running.) RESTIC_REPOSITORY is injected
+    like the engine's own Leg.env — the repository travels via env, not
+    argv."""
+    fake_bin = Path(engine.plugin_data_dir()) / dirname
     fake_bin.mkdir(parents=True, exist_ok=True)
     proc_path = fake_bin / "restic"
-    shutil.copy2("/bin/sleep", proc_path)  # pgrep -x matches the file's name
-    process = subprocess.Popen([str(proc_path), "30"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    shutil.copy2("/bin/bash", proc_path)
+    return subprocess.Popen([str(proc_path), "-c", "sleep 30; sleep 30"],
+                            env={**os.environ, "RESTIC_REPOSITORY": repository},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def test_cycle_skip_when_restic_runs_for_our_repo(data_root, tmp_path, plugin_env,
+                                                  source_tree, local_repo, real_guard):
+    """A live restic process FOR OUR repository blocks the cycle cleanly
+    (repo-scoped guard: its RESTIC_REPOSITORY references this repo)."""
+    process = _spawn_fake_restic("fake-restic-ours", str(local_repo))
     try:
         time.sleep(0.3)
-        real_pgrep()
-        assert engine.restic_process_running()
+        real_guard()
         cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
         result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
         assert result["skipped"] is True
-        assert "restic cycle is already running" in result["reason"]
+        assert "already running" in result["reason"], result
+        assert str(local_repo) in result["reason"], result
     finally:
         process.terminate()
         process.wait(timeout=5)
+
+
+def test_cycle_runs_despite_foreign_restic_process(data_root, tmp_path, plugin_env,
+                                                   source_tree, real_guard,
+                                                   restic_shim, shim_state):
+    """Drill-round-1 finding: a restic process for a DIFFERENT repository (a
+    foreign production stack on the same machine, different home) must NOT
+    block this config's cycle — the old bare ``pgrep restic`` did. The
+    r2-only config additionally covers the ``s3:`` repo-identifier matching
+    path, and the faked shim keeps the cycle restic-free (fast)."""
+    process = _spawn_fake_restic("fake-restic-foreign",
+                                 "s3:https://other.example.com/other-bucket")
+    try:
+        time.sleep(0.3)
+        real_guard()
+        cfg = make_cfg(tmp_path, source_tree, r2=True)
+        result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
+        assert result.get("skipped") is not True, result
+        assert result["verdict"] in ("ok", "warn", "fail"), result
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_cycle_skip_when_our_repo_holds_lock_files(data_root, tmp_path, plugin_env,
+                                                   source_tree, local_repo, real_guard):
+    """Restic's own lock files in OUR local repo block the cycle — the
+    primary repo-scoped signal; no running process is required."""
+    locks = Path(local_repo) / "locks"
+    locks.mkdir(exist_ok=True)
+    (locks / "1759000000123456789.lock").write_text("lock")
+    real_guard()
+    cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
+    result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
+    assert result["skipped"] is True
+    assert "lock" in result["reason"], result
+
+
+def test_cycle_runs_despite_foreign_repo_lock_files(data_root, tmp_path, plugin_env,
+                                                    source_tree, real_guard):
+    """Lock files in a DIFFERENT repository must never block this config's
+    cycle — the drill-round-1 finding, lock-file flavor. Our local repo path
+    is deliberately unmounted (absent): the guard must find no locks of ours
+    and let the cycle proceed to its leg-level verdicts, all restic-free."""
+    foreign = tmp_path / "foreign-repo"
+    (foreign / "locks").mkdir(parents=True)
+    (foreign / "locks" / "1759000000123456789.lock").write_text("lock")
+    real_guard()
+    cfg = make_cfg(tmp_path, source_tree,
+                   local_repo=str(tmp_path / "not-mounted-repo"))
+    result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
+    assert result.get("skipped") is not True, result
+    assert result["verdict"] == "fail"  # both legs unmounted/unconfigured
 
 
 def test_cycle_no_wanted_legs_fails_with_setup_guidance(data_root, tmp_path,
