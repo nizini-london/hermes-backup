@@ -40,7 +40,7 @@ if "cache" in os.environ.get("PYTEST_DEBUG_TEMPROOT", "").lower() or \
     os.makedirs(_base, exist_ok=True)
     os.environ["PYTEST_DEBUG_TEMPROOT"] = _base
 
-TEST_PASSWORD = "test-restic-password-0123456789"
+TEST_PASSPHRASE = "test-restic-password-0123456789"
 
 
 @pytest.fixture(autouse=True)
@@ -102,11 +102,11 @@ def _mkdir(path: Path) -> Path:
 @pytest.fixture()
 def plugin_env(monkeypatch, tmp_path):
     """Standalone secret resolution + isolated restic cache."""
-    monkeypatch.setenv("HERMES_BACKUP_RESTIC_PASSWORD", TEST_PASSWORD)
+    monkeypatch.setenv("HERMES_BACKUP_RESTIC_PASSWORD", TEST_PASSPHRASE)
     monkeypatch.setenv("HERMES_BACKUP_R2_ACCESS_KEY", "test-access-key")
     monkeypatch.setenv("HERMES_BACKUP_R2_SECRET_KEY", "test-secret-key-0123")
     monkeypatch.setenv("RESTIC_CACHE_DIR", str(tmp_path / "restic-cache"))
-    return {"password": TEST_PASSWORD}
+    return {"password": TEST_PASSPHRASE}
 
 
 @pytest.fixture()

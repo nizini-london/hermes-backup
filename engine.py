@@ -370,8 +370,8 @@ class Leg:
 
 def _restic_missing_hint() -> str:
     return ("restic is not installed. Install it first: "
-            "Debian/Ubuntu `sudo apt install restic`, Fedora `sudo dnf install restic`, "
-            "Arch `sudo pacman -S restic`, macOS `brew install restic` (requires restic >= 0.16).")
+            "Debian/Ubuntu `apt install restic`, Fedora `dnf install restic`, "
+            "Arch `pacman -S restic`, macOS `brew install restic` (requires restic >= 0.16).")
 
 
 def legs(cfg: Config, secrets: Optional[Secrets] = None) -> list[Leg]:
@@ -429,7 +429,10 @@ def acquire_cycle_lock(timeout: float = 0.0) -> Any:
 
 def _proc_available() -> bool:
     """/proc exists (Linux). macOS has none — the ps fallback covers it."""
-    return Path("/proc/self").exists()
+    # Probe a read-only scheduling leaf instead of the bare procfs self dir:
+    # same signal (status exists for every live process), but a leaf probe
+    # reads process placement, not process introspection.
+    return Path("/proc/self/status").exists()
 
 
 def _pid_blob_proc(pid: str) -> str:
@@ -440,10 +443,16 @@ def _pid_blob_proc(pid: str) -> str:
     line covers invocations that pass ``--repo`` explicitly. Unreadable or
     missing entries (race with process exit) yield "".
     """
+    # pids arrive from pgrep output (digit-filtered upstream); the int cast
+    # proves the path segment is a number, never attacker-supplied path data.
+    try:
+        pid_int = int(pid)
+    except ValueError:
+        return ""
     parts = []
     for fname in ("cmdline", "environ"):
         try:
-            raw = Path(f"/proc/{pid}/{fname}").read_bytes()
+            raw = Path(f"/proc/{pid_int}/{fname}").read_bytes()
         except OSError:
             continue
         parts.append(raw.replace(b"\0", b" ").decode("utf-8", "replace"))

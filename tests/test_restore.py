@@ -26,7 +26,7 @@ def cycle_ok(cfg):
 
 def test_refuses_paths_outside_source(data_root, tmp_path, source_tree):
     cfg = make_cfg(tmp_path, source_tree)
-    for bad in ("/etc/passwd", str(tmp_path / "outside" / "file"), "~/notes"):
+    for bad in ("/etc/hostname", str(tmp_path / "outside" / "file"), "~/notes"):
         out = tools.handle("backup_restore", {"path": bad}, cfg=cfg)
         parsed = json.loads(out)
         assert parsed["ok"] is False, (bad, out)
