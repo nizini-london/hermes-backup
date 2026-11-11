@@ -13,7 +13,7 @@ description: >
   that proves restores actually come back.
 author: Shaun Xenon
 license: MIT
-homepage: https://github.com/shaun-xenon/hermes-backup
+homepage: https://github.com/nizini-london/hermes-backup
 tags: [backup, restore, restic, disaster-recovery, safety, encryption]
 
 provides_tools:
