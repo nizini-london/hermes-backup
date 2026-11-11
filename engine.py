@@ -527,9 +527,13 @@ def repo_lock_files(repo: str) -> list[str]:
     extension (transient ``<id>.tmp`` files can appear while a lock is
     created) — so ANY entry in ``locks/`` counts as busy; an empty or absent
     directory is idle. They live INSIDE the repository, so the signal is
-    repo-scoped by construction — restic's own source of truth. Lock file
-    contents are encrypted; existence is the signal. This plugin's read
-    commands run with ``--no-lock`` and never create one.
+    repo-scoped by construction — restic's own source of truth. On a
+    repository shared across hosts the lock file is the ONLY signal: a
+    restic process on the other host is invisible to local pgrep, so its
+    lock is all that stands between this drill and a concurrent
+    maintenance run. Lock file contents are encrypted; existence is the
+    signal. This plugin's read commands run with ``--no-lock`` and never
+    create one.
     """
     try:
         return sorted(p.name for p in (Path(repo) / "locks").iterdir())
