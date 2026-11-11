@@ -427,28 +427,69 @@ def acquire_cycle_lock(timeout: float = 0.0) -> Any:
     return fd
 
 
-def _restic_pid_blobs(pids: list[str]) -> list[str]:
-    """Command line + environment text per restic pid (best effort).
+def _proc_available() -> bool:
+    """/proc exists (Linux). macOS has none — the ps fallback covers it."""
+    return Path("/proc/self").exists()
+
+
+def _pid_blob_proc(pid: str) -> str:
+    """Command line + environment text for ``pid`` from /proc (Linux).
 
     The repository travels to restic via ``RESTIC_REPOSITORY`` (``Leg.env``),
     not argv, so the environment must be part of the fingerprint; the command
     line covers invocations that pass ``--repo`` explicitly. Unreadable or
-    missing /proc entries (non-Linux, race with process exit) yield "".
-    The blobs exist ONLY for the repo match below — they can carry other
-    processes' secret environment (RESTIC_PASSWORD, AWS keys) and must never
-    be logged, returned, or persisted.
+    missing entries (race with process exit) yield "".
     """
-    blobs = []
+    parts = []
+    for fname in ("cmdline", "environ"):
+        try:
+            raw = Path(f"/proc/{pid}/{fname}").read_bytes()
+        except OSError:
+            continue
+        parts.append(raw.replace(b"\0", b" ").decode("utf-8", "replace"))
+    return " \n ".join(parts)
+
+
+def _pid_blobs_ps(pids: list[str]) -> list[str]:
+    """Non-Linux fallback: ps instead of /proc.
+
+    argv via ``ps -axo pid=,command=`` (BSD and procps), environment via BSD
+    ``ps -E -p`` — same-user processes only, which is who this guard is for
+    (the scheduler's own cycles and the user's other restic stacks; other
+    users' environments need root and stay invisible). The ENTIRE ``ps -E``
+    output is appended so the match works regardless of the column layout.
+    """
+    blobs = {pid: "" for pid in pids}
+    try:
+        proc = subprocess.run(["ps", "-axo", "pid=,command="],
+                              capture_output=True, text=True, timeout=10)
+        for line in (proc.stdout or "").splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if pid in blobs:
+                blobs[pid] = command
+    except (OSError, subprocess.SubprocessError):
+        pass
     for pid in pids:
-        parts = []
-        for fname in ("cmdline", "environ"):
-            try:
-                raw = Path(f"/proc/{pid}/{fname}").read_bytes()
-            except OSError:
-                continue
-            parts.append(raw.replace(b"\0", b" ").decode("utf-8", "replace"))
-        blobs.append(" \n ".join(parts))
-    return blobs
+        try:
+            proc = subprocess.run(["ps", "-E", "-p", pid],
+                                  capture_output=True, text=True, timeout=10)
+            blobs[pid] += " \n " + (proc.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return [blobs[pid] for pid in pids]
+
+
+def _restic_pid_blobs(pids: list[str]) -> list[str]:
+    """Command line + environment text per restic pid (best effort).
+
+    /proc on Linux; the ps fallback where /proc is absent (macOS). The blobs
+    exist ONLY for the repo match in :func:`restic_process_running` — they
+    can carry other processes' secret environment (RESTIC_PASSWORD, AWS
+    keys) and must never be logged, returned, or persisted.
+    """
+    if _proc_available():
+        return [_pid_blob_proc(pid) for pid in pids]
+    return _pid_blobs_ps(pids)
 
 
 def restic_process_running(repos: Sequence[str] = ()) -> bool:
@@ -478,16 +519,20 @@ def restic_process_running(repos: Sequence[str] = ()) -> bool:
 
 
 def repo_lock_files(repo: str) -> list[str]:
-    """Restic's own lock files for a local repository (``<repo>/locks/*.lock``).
+    """Restic's own lock files for a local repository (``<repo>/locks/``).
 
     Restic creates one for every lock-taking operation (backup, check,
-    prune) and removes it on clean exit; they live INSIDE the repository, so
-    the signal is repo-scoped by construction — restic's own source of
-    truth. Lock file contents are encrypted; existence is the signal. This
-    plugin's read commands run with ``--no-lock`` and never create one.
+    prune) and removes it on clean exit. The real layout (verified against
+    restic 0.18.1): files are named by their 64-character hex id with NO
+    extension (transient ``<id>.tmp`` files can appear while a lock is
+    created) — so ANY entry in ``locks/`` counts as busy; an empty or absent
+    directory is idle. They live INSIDE the repository, so the signal is
+    repo-scoped by construction — restic's own source of truth. Lock file
+    contents are encrypted; existence is the signal. This plugin's read
+    commands run with ``--no-lock`` and never create one.
     """
     try:
-        return sorted(p.name for p in (Path(repo) / "locks").glob("*.lock"))
+        return sorted(p.name for p in (Path(repo) / "locks").iterdir())
     except OSError:
         return []
 

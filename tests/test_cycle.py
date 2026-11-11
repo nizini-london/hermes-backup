@@ -288,15 +288,50 @@ def test_cycle_runs_despite_foreign_restic_process(data_root, tmp_path, plugin_e
 def test_cycle_skip_when_our_repo_holds_lock_files(data_root, tmp_path, plugin_env,
                                                    source_tree, local_repo, real_guard):
     """Restic's own lock files in OUR local repo block the cycle — the
-    primary repo-scoped signal; no running process is required."""
+    primary repo-scoped signal; no running process is required. The name
+    mirrors restic's REAL lock layout (Greptile round-1 P1): extensionless
+    64-character hex ids under locks/ — NOT '*.lock'."""
     locks = Path(local_repo) / "locks"
     locks.mkdir(exist_ok=True)
-    (locks / "1759000000123456789.lock").write_text("lock")
+    (locks / "fdc84cb25f511c30bd1c19c7a6559ba62aaca24a8c6dc8391622146ce1c997f7").write_text("lock")
     real_guard()
     cfg = make_cfg(tmp_path, source_tree, local_repo=local_repo)
     result = engine.run_cycle(cfg, prune="skip", secrets=fresh_secrets())
     assert result["skipped"] is True
     assert "lock" in result["reason"], result
+
+
+def test_guard_proc_match_survives_without_proc(data_root, tmp_path, plugin_env,
+                                                monkeypatch, real_guard):
+    """Non-Linux fallback (Greptile round-1 P1): macOS has no /proc, so the
+    guard must identify repos via ps — argv via `ps -axo pid=,command=` and
+    the environment via BSD `ps -E` (same-user processes: the scheduler's own
+    cycles and the user's other restic stacks). Simulated here by disabling
+    the /proc probe and faking the ps outputs."""
+    real_guard()  # re-arm the REAL detection over the autouse host isolation
+    monkeypatch.setattr(engine, "_proc_available", lambda: False)
+
+    def fake_run(argv, **kwargs):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        if argv[:2] == ["pgrep", "-x"]:
+            R.stdout = "4711\n"
+        elif argv[:3] == ["ps", "-axo", "pid=,command="]:
+            R.stdout = ("  4711 restic backup --repo /repos/mine /home/x\n"
+                        "  4712 bash -c sleep 30\n")
+        elif argv[:2] == ["ps", "-E"]:
+            R.stdout = ("  4711 ttys001  0:00.12 restic backup --repo /repos/mine\n"
+                        "RESTIC_ENV_SCAN: RESTIC_REPOSITORY=/repos/mine "
+                        "RESTIC_PASSWORD=super-secret-do-not-match\n")
+        else:
+            R.returncode = 1
+        return R()
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    assert engine.restic_process_running(["/repos/mine"]) is True
+    assert engine.restic_process_running(["/repos/other"]) is False
 
 
 def test_cycle_runs_despite_foreign_repo_lock_files(data_root, tmp_path, plugin_env,
