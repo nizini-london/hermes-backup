@@ -127,6 +127,21 @@ import plugin from './plugin-under-test.mjs'
 globalThis.__BACKUP_STATUS_JSON__ = process.env.BACKUP_STATUS_JSON ?? 'null'
 globalThis.__KEY_VIOLATIONS__ = []
 
+// Pin the renderer's clock to the fixture's own "now". desktop/plugin.js
+// ages snapshots against Date.now() (production-correct), but the fixtures
+// capture NOW at module import (pytest collection) — any suite runtime
+// before this file executes drifts the asserted minute buckets (2m → 3m at
+// +60s; the repo-scoped-guard tests legitimately made the suite slower and
+// tripped exactly that). Pinning makes each fixture self-consistent and the
+// render deterministic; production behavior is untouched (driver is
+// test-only).
+try {
+  const stNow = JSON.parse(globalThis.__BACKUP_STATUS_JSON__ ?? 'null')?.now
+  if (typeof stNow === 'number' && Number.isFinite(stNow)) {
+    Date.now = () => stNow * 1000
+  }
+} catch { /* unparsable status: leave the real clock in place */ }
+
 const registered = []
 const ctx = { register: (cfg) => registered.push(cfg) }
 plugin.register(ctx)
