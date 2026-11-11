@@ -317,20 +317,29 @@ def test_guard_proc_match_survives_without_proc(data_root, tmp_path, plugin_env,
             stdout = ""
             stderr = ""
         if argv[:2] == ["pgrep", "-x"]:
-            R.stdout = "4711\n"
+            R.stdout = "4711\n4713\n"
         elif argv[:3] == ["ps", "-axo", "pid=,command="]:
-            R.stdout = ("  4711 restic backup --repo /repos/mine /home/x\n"
+            # NOTE: pid 4711's command line must NOT contain a repository —
+            # the engine puts the repo in RESTIC_REPOSITORY, so the positive
+            # assertion below must be satisfiable ONLY via the ps -E env
+            # output (Greptile round-2 P2). 4713 covers the argv path
+            # (--repo) with a different env repo.
+            R.stdout = ("  4711 restic backup /home/x\n"
+                        "  4713 restic backup --repo /repos/argvonly /home/x\n"
                         "  4712 bash -c sleep 30\n")
         elif argv[:2] == ["ps", "-E"]:
-            R.stdout = ("  4711 ttys001  0:00.12 restic backup --repo /repos/mine\n"
-                        "RESTIC_ENV_SCAN: RESTIC_REPOSITORY=/repos/mine "
-                        "RESTIC_PASSWORD=super-secret-do-not-match\n")
+            per_pid = {"4711": "RESTIC_REPOSITORY=/repos/mine",
+                       "4713": "RESTIC_REPOSITORY=/repos/foreign"}
+            pid = argv[-1]
+            R.stdout = (f"  {pid} ttys001  0:00.12 restic\n"
+                        + per_pid.get(pid, ""))
         else:
             R.returncode = 1
         return R()
 
     monkeypatch.setattr(engine.subprocess, "run", fake_run)
-    assert engine.restic_process_running(["/repos/mine"]) is True
+    assert engine.restic_process_running(["/repos/mine"]) is True  # env only
+    assert engine.restic_process_running(["/repos/argvonly"]) is True  # argv only
     assert engine.restic_process_running(["/repos/other"]) is False
 
 
